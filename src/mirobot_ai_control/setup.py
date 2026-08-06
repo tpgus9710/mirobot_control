@@ -28,6 +28,7 @@ setup(
             'ai_node = mirobot_ai_control.ai_node:main',
             'ai_node_new = mirobot_ai_control.ai_node_new:main',
             'gui_node = mirobot_ai_control.gui_node:main',
+            'logger_node = mirobot_ai_control.ai_node_new_test_logger:main',
         ],
     },
 )
