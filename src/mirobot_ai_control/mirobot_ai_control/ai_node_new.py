@@ -543,6 +543,28 @@ class MirobotAiNode(Node):
     CART_BETA       = 0.015
     CART_D_CUTOFF   = 1.0
 
+    # ── 카테시안 중앙값 사전필터 창 크기 ─────────────────────────────────
+    # [측정 결과 — 지연의 최대 단일 원인]
+    # 창=3인 중앙값은 "단조롭게 움직이는 신호"에 대해 정확히 1프레임 지연이다.
+    # 정렬한 3개 중 가운데 = 항상 직전 프레임 값이기 때문. 20Hz면 그대로 50ms.
+    # (원래 주석의 "지연을 거의 없앰"은 튀는 값 기준 설명이고, 실제 추종
+    #  지연에는 해당하지 않는다.)
+    #
+    #   손 100mm/s 기준 추종 지연 실측(시뮬레이션):
+    #     창=3, cutoff 1.2 →  91ms   ← 현재
+    #     창=1, cutoff 1.2 →  41ms
+    #     창=3, cutoff 3.0 →  80ms   (창을 두면 cutoff를 올려도 11ms만 준다)
+    #     창=1, cutoff 3.0 →  30ms
+    #
+    # 즉 cutoff 튜닝보다 이 창을 없애는 쪽이 훨씬 크다. 다만 이 필터는
+    # MediaPipe가 한두 프레임 튀는 것을 막는 역할도 하므로, 1로 내린 뒤
+    # 떨림이 돌아오면 3으로 되돌릴 것. GRU 보정이 이 필터보다 앞단에서
+    # 이미 랜드마크 튐을 잡고 있으므로 역할이 상당 부분 중복된다.
+    #
+    #   1 = 사실상 비활성(들어온 값을 그대로 통과)
+    #   3 = 기존 동작
+    CART_MEDIAN_WINDOW = 3
+
     # J5는 IK와 무관한 독립 축이라 v1 파라미터를 그대로 유지
     D_CUTOFF = 1.0
     J5_MIN_CUTOFF, J5_BETA = 2.0, 0.6
@@ -571,7 +593,28 @@ class MirobotAiNode(Node):
     # 큰 걸음으로 움직여서 "내 팔과 안 맞는다"는 체감의 큰 원인이었음.
     # robot_node는 최신값 덮어쓰기 + ok 게이팅 구조라 시리얼이 넘치지 않음.
     # 혹시 불안정하면 0.2(5Hz)로 올려서 확인할 것.
-    PUB_INTERVAL = 0.1   # 10Hz
+    #
+    # [0.1 → 0.05 변경 근거 — 시뮬레이션으로 확인함]
+    # robot_node._try_send_pending()은 pending_joint_target 이라는 '단일 슬롯'에
+    # 덮어쓰기만 하고, busy(=직전 명령의 'ok' 대기) 동안은 아무것도 안 보낸다.
+    # 따라서 실제 시리얼 전송 횟수는 발행률이 아니라 GRBL 완료 속도가 결정한다.
+    # 발행률을 올리면 '전송되는 값이 더 신선해질' 뿐 전송 횟수는 그대로다:
+    #
+    #   GRBL 1동작   발행률   실제 시리얼    전송된 값의 평균 노후도
+    #     150ms      10Hz     6.1 회/초          39.2ms
+    #     150ms      20Hz     6.1 회/초          15.0ms   ← 24ms 개선, 전송량 동일
+    #     250ms      10Hz     3.8 회/초          44.7ms
+    #     250ms      20Hz     3.8 회/초          20.7ms
+    #     400ms      10Hz     2.4 회/초          38.8ms
+    #     400ms      20Hz     2.4 회/초          21.0ms
+    #
+    # [주의] 이 이득은 손이 빠르게 움직일 때만 온전히 나온다. 저속에서는
+    # DEADBAND_CART_MM(4.0mm)이 먼저 걸려서 발행 자체가 막히기 때문:
+    #   손 10mm/s → 실효 발행간격 400ms,  20mm/s → 200ms  (발행률과 무관)
+    # 미세 조작이 굼뜨게 느껴지면 PUB_INTERVAL이 아니라 DEADBAND_CART_MM을
+    # 봐야 한다. 다만 데드밴드를 낮추면 정지 중 떨림이 그대로 로봇에 나가므로
+    # 반드시 실기로 확인하고 내릴 것.
+    PUB_INTERVAL = 0.05   # 20Hz (process_frame 타이머와 동일 — 게이트에서 버려지는 프레임 없음)
 
     # ── 관절 소프트 리밋 (robot_node.JOINT_HARD_LIMITS와 동일) ───────────
     # 상위에서 미리 막아서, 하드 리밋에 걸려 "6축 명령 전체가 무시되는" 일을 방지.
@@ -798,9 +841,9 @@ class MirobotAiNode(Node):
         self.f_cx = OneEuroFilter(self.CART_MIN_CUTOFF, self.CART_BETA, self.CART_D_CUTOFF)
         self.f_cy = OneEuroFilter(self.CART_MIN_CUTOFF, self.CART_BETA, self.CART_D_CUTOFF)
         self.f_cz = OneEuroFilter(self.CART_MIN_CUTOFF, self.CART_BETA, self.CART_D_CUTOFF)
-        self.m_cx = MedianPrefilter(window=3)
-        self.m_cy = MedianPrefilter(window=3)
-        self.m_cz = MedianPrefilter(window=3)
+        self.m_cx = MedianPrefilter(window=self.CART_MEDIAN_WINDOW)
+        self.m_cy = MedianPrefilter(window=self.CART_MEDIAN_WINDOW)
+        self.m_cz = MedianPrefilter(window=self.CART_MEDIAN_WINDOW)
 
         # J5 / J6은 IK와 무관한 독립 축이므로 v1 파이프라인 유지
         self.f_j5 = OneEuroFilter(self.J5_MIN_CUTOFF, self.J5_BETA, self.D_CUTOFF)
@@ -875,6 +918,28 @@ class MirobotAiNode(Node):
 
         self.last_joint_pub_time   = 0.0
         self.last_gripper_pub_time = 0.0
+
+        # ══════════════════════════════════════════════════════════════════
+        #  [지연 계측] 프레임 수신 → 관절명령 발행까지의 파이 내부 지연
+        #
+        #  왜 이 계측이 필요한가:
+        #    체감 지연의 원인이 네트워크인지, 필터인지, 발행 게이트인지,
+        #    GRBL인지를 추측으로 구분할 수 없다. remote_frame_time(업로드
+        #    웹소켓이 프레임을 받은 시각)과 발행 시각은 '같은 시계'라서
+        #    클럭 오차 없이 파이 내부 구간만 정확히 뗄 수 있다.
+        #    (폰→파이 편도 지연은 여기 안 잡힘 — 그건 별도 왕복 측정 필요)
+        #
+        #  [호밍 안전 — 명시적 확인]
+        #    이 세 변수는 오직 로그 출력에만 쓰이는 통계 누적기다. 제어
+        #    경로(목표값·관절각·그리퍼)에서 읽는 곳이 한 곳도 없고, 큐/버퍼/
+        #    지연 전송 구조가 아니므로 낡은 값이 재생될 경로 자체가 없다.
+        #    따라서 _hard_reset_control_state()에 등록하지 않는다. 오히려
+        #    호밍마다 초기화하면 통계가 끊겨 계측 목적에 반한다.
+        # ══════════════════════════════════════════════════════════════════
+        self.lat_samples = []          # 최근 구간의 지연 샘플(초)
+        self.lat_last_report = 0.0     # 마지막 요약 출력 시각
+        self.LAT_REPORT_SEC = 2.0      # 요약 출력 주기
+        self.LAT_LOG_ENABLE = True     # 튜닝이 끝나면 False로 끌 것
 
         # 리셋 직후 첫 유효 프레임은 "기준점 캡처"에만 쓰고 명령을 내리지 않음
         self.first_frame_after_reset = True
@@ -1172,6 +1237,46 @@ class MirobotAiNode(Node):
 
         if reason:
             self.get_logger().info(f"[제어상태 전체 리셋] {reason}")
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  [지연 계측] 프레임 수신 → 관절명령 발행 구간 요약
+    #
+    #  읽는 법 (수치는 '파이 내부'만. 폰 카메라·업로드 구간은 미포함):
+    #    - avg 가 100ms를 넘으면 필터/발행게이트가 원인일 가능성이 큼
+    #      → CART_MEDIAN_WINDOW를 1로, 그래도 크면 CART_MIN_CUTOFF를 올림
+    #    - max 만 크고 avg는 작으면 CPU 스파이크(추론 밀림)
+    #    - n(초당 발행수)이 기대치보다 훨씬 작으면 DEADBAND_CART_MM에 막힌 것
+    #      (저속 미세조작 구간에서 정상적으로 발생함)
+    #
+    #  이 함수는 로그만 출력하며 어떤 제어 상태도 바꾸지 않는다.
+    # ══════════════════════════════════════════════════════════════════════
+    def _record_latency(self, dt_sec, now):
+        self.lat_samples.append(dt_sec)
+
+        if self.lat_last_report == 0.0:
+            self.lat_last_report = now
+            return
+        if now - self.lat_last_report < self.LAT_REPORT_SEC:
+            return
+
+        s = self.lat_samples
+        self.lat_samples = []
+        span = now - self.lat_last_report
+        self.lat_last_report = now
+        if not s:
+            return
+
+        s_sorted = sorted(s)
+        p50 = s_sorted[len(s_sorted) // 2] * 1000.0
+        self.get_logger().info(
+            f"[지연] 수신→발행  평균 {sum(s)/len(s)*1000:5.1f}ms  "
+            f"중앙 {p50:5.1f}ms  최소 {s_sorted[0]*1000:5.1f}ms  "
+            f"최대 {s_sorted[-1]*1000:5.1f}ms  |  "
+            f"발행 {len(s)/span:4.1f}회/초  "
+            f"(median창={self.CART_MEDIAN_WINDOW} "
+            f"cutoff={self.CART_MIN_CUTOFF} "
+            f"pub={1.0/self.PUB_INTERVAL:.0f}Hz "
+            f"deadband={self.DEADBAND_CART_MM}mm)")
 
     def _reset_motion_filters(self):
         """v1과의 호환용 별칭. 실제 동작은 전체 리셋과 동일."""
@@ -2881,6 +2986,12 @@ class MirobotAiNode(Node):
                         joint_msg.data = [float(v) for v in out]
                         self.ai_joints_pub.publish(joint_msg)
                         self.last_joint_pub_time = current_time
+
+                        # [지연 계측] 이 명령이 어느 프레임에서 비롯됐고,
+                        # 그 프레임이 도착한 지 얼마나 지났는지 기록.
+                        # frame_src_t < 0 이면 로컬 웹캠 소스라 측정 대상이 아님.
+                        if self.LAT_LOG_ENABLE and frame_src_t > 0:
+                            self._record_latency(current_time - frame_src_t, current_time)
 
                 # ── 그리퍼 발행 ────────────────────────────────────────────
                 if (proposed_gripper is not None and publish_allowed and
