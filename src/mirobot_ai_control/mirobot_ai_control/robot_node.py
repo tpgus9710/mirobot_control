@@ -153,6 +153,12 @@ class MirobotDriverNode(Node):
     # 로봇 부팅 시 비동기 스레드로 홈 복귀 시퀀스 가동 (실행 병목 제거)
     def init_robot(self):
         if self.ser and self.ser.is_open:
+            # 스레드가 실제로 뜨기 전의 짧은 틈에도 joint_callback이 새 목표값을
+            # 큐에 쌓을 수 있으므로, 스레드 기동 전에 is_homing을 먼저 걸고
+            # 혹시 이미 쌓여있던 목표값(대기 큐)도 여기서 미리 비워둠.
+            self.is_homing = True
+            self.pending_joint_target = None
+            self.pending_gripper_target = None
             threading.Thread(target=self.run_homing_sequence, daemon=True).start()
 
     # 홈 복귀 완수를 모니터링하는 코어 가동 루프 수행.
@@ -161,7 +167,11 @@ class MirobotDriverNode(Node):
             return
             
         self.get_logger().info("하드웨어 호밍(원점 정렬)을 시작합니다. 완료될 때까지 다른 명령은 무시됩니다...")
+        # 호출부(raw_callback/init_robot)에서 이미 걸어뒀겠지만, 이 함수가 다른 경로로
+        # 호출될 가능성까지 대비해 여기서도 한 번 더 확실히 걸고 큐를 비움(idempotent).
         self.is_homing = True
+        self.pending_joint_target = None
+        self.pending_gripper_target = None
         
         status_msg = Bool()
         status_msg.data = True
@@ -196,7 +206,11 @@ class MirobotDriverNode(Node):
         with self.serial_lock:
             self.ser.write(b"O105\r\n")
         time.sleep(0.5)
-            
+
+        # 호밍 진행 중 어떤 경로로든 큐에 뭔가 쌓였을 가능성까지 마지막으로 한 번 더
+        # 차단 — is_homing을 풀기 직전이 "낡은 목표값 재생"을 막을 마지막 기회.
+        self.pending_joint_target = None
+        self.pending_gripper_target = None
         self.is_homing = False
         # 호밍 직후 로봇은 실제로 정지·대기 상태이므로 busy를 확실히 풀어줌
         self.busy = False
@@ -211,6 +225,16 @@ class MirobotDriverNode(Node):
             cmd = msg.data.strip()
             if cmd == "$H":
                 if not self.is_homing:
+                    # [호밍 전 목표값 잔류 방지] 스레드가 실제로 뜨기 전 짧은 틈에도
+                    # joint_callback이 새 목표값을 큐에 쌓을 수 있고, 무엇보다
+                    # "호밍이 시작되기 직전 이미 큐에 대기 중이던 목표값"이 그대로
+                    # 남아있다가 호밍이 끝나는 순간 그대로 재생되면 방금 원점으로
+                    # 돌아온 로봇이 갑자기 그 낡은 각도로 급이동하는 사고로 이어짐
+                    # (실제로 발생했던 "호밍 후 이상한 자세로 갈리는" 증상의 원인).
+                    # 그래서 스레드 기동 전에 is_homing부터 걸고 큐를 반드시 비움.
+                    self.is_homing = True
+                    self.pending_joint_target = None
+                    self.pending_gripper_target = None
                     threading.Thread(target=self.run_homing_sequence, daemon=True).start()
             else:
                 if not self.is_homing:

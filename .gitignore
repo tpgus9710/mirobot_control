@@ -5,3 +5,5 @@ log/
 __pycache__/
 .vscode/
 *.egg-info/
+*.npz
+src/mirobot_ai_control/mirobot_ai_control/node_backup/
