@@ -49,13 +49,21 @@ except ImportError:
 #  즉 "가만히 있을 땐 안정적, 빠르게 움직이면 바로 따라오는" 필터.
 # ══════════════════════════════════════════════════════════════════════════
 class OneEuroFilter:
-    def __init__(self, min_cutoff=1.0, beta=0.0, d_cutoff=1.0):
+    def __init__(self, min_cutoff=1.0, beta=0.0, d_cutoff=1.0, max_cutoff=None):
         # min_cutoff: 정지/저속 구간에서의 저역통과 강도. 작을수록 떨림을 더 강하게 억제.
         # beta: 속도가 커질수록 cutoff를 얼마나 더 풀어줄지 결정. 클수록 빠른 동작 지연이 줄어듦.
         # d_cutoff: 속도 자체를 추정할 때 쓰는 저역통과 강도 (속도 추정값의 노이즈 억제용).
+        #
+        # max_cutoff: cutoff 의 상한(Hz). None 이면 무제한(기존 동작).
+        #   [왜 필요한가] 이 필터는 "속도가 크면 실제 움직임이다"라고 가정하는데,
+        #   입력 노이즈가 커지면 그 노이즈 자체가 큰 속도로 추정되면서 cutoff 가
+        #   올라가고 → 스무딩이 풀리고 → 노이즈가 더 통과하는 되먹임이 생긴다.
+        #   상한을 두면 "아무리 빠르게 보여도 이 이상은 풀지 않는다"가 보장된다.
+        #   스무딩을 더 거는 방향으로만 작동하므로 안전 쪽으로만 틀어진다.
         self.min_cutoff = min_cutoff
         self.beta = beta
         self.d_cutoff = d_cutoff
+        self.max_cutoff = max_cutoff
         self.x_prev = None
         self.dx_prev = 0.0
         self.t_prev = None
@@ -65,7 +73,10 @@ class OneEuroFilter:
         tau = 1.0 / (2 * math.pi * cutoff)
         return 1.0 / (1.0 + tau / dt)
 
-    def filter(self, x, t):
+    def filter(self, x, t, min_cutoff=None):
+        # min_cutoff 를 넘기면 이번 호출에 한해 생성자 값 대신 그것을 쓴다.
+        # (팔을 뻗은 정도에 따라 스무딩 강도를 매 프레임 바꾸기 위한 용도.
+        #  필터 내부 상태는 그대로 유지되므로 값이 튀지 않는다.)
         if self.t_prev is None:
             # 첫 샘플은 스무딩 없이 그대로 채택 (초기화)
             self.x_prev = x
@@ -80,7 +91,10 @@ class OneEuroFilter:
         dx_hat = a_d * dx + (1 - a_d) * self.dx_prev
 
         # 2) 추정 속도가 클수록 cutoff를 키워서 스무딩을 약하게 적용
-        cutoff = self.min_cutoff + self.beta * abs(dx_hat)
+        mc = self.min_cutoff if min_cutoff is None else max(min_cutoff, 1e-3)
+        cutoff = mc + self.beta * abs(dx_hat)
+        if self.max_cutoff is not None:
+            cutoff = min(cutoff, self.max_cutoff)
         a = self._alpha(cutoff, dt)
         x_hat = a * x + (1 - a) * self.x_prev
 
@@ -123,16 +137,25 @@ class OneEuroFilter:
 # ══════════════════════════════════════════════════════════════════════════
 class MedianPrefilter:
     def __init__(self, window=3):
+        # 버퍼는 window 만큼 잡아두고, 실제로 몇 개를 쓸지는 filter() 인자로
+        # 매 프레임 정할 수 있다. 팔을 뻗은 구간에서만 창을 넓혀서 노이즈를
+        # 더 누르고, 중립 근처에서는 기존 창을 그대로 써서 지연을 안 늘리기
+        # 위한 구조. (창을 늘리면 그만큼 추종 지연이 붙으므로 항상 넓히면 손해)
         self.window = window
         self.buf = deque(maxlen=window)
 
-    def filter(self, x):
+    def filter(self, x, window=None):
         self.buf.append(x)
         # 버퍼가 아직 안 찼어도(첫 1~2프레임) 그 시점까지 모인 값들의
         # 중앙값을 그대로 반환 — len=1이면 그 값 자체, len=2면 둘 중
-        # 정렬상 뒤쪽 값(정확한 중앙값 정의상 평균을 써도 되지만, 여기선
+        # 정렬상 뒤쪽 값(정확한 중앙값 정의상 평균을 써도 되지만, 여긴
         # "튄 값 하나에 안 흔들린다"는 목적에는 이 방식으로 충분하고 더 단순함).
-        return sorted(self.buf)[len(self.buf) // 2]
+        if window is None or window >= len(self.buf):
+            sub = self.buf
+        else:
+            # 가장 최근 window 개만 사용 (deque 슬라이싱 불가 → list 변환)
+            sub = list(self.buf)[-max(1, int(window)):]
+        return sorted(sub)[len(sub) // 2]
 
     def reset(self):
         # OneEuroFilter.reset()과 같은 시점(AI ON/OFF, 팔 전환, J5 stale-gap)에
@@ -204,7 +227,27 @@ class MirobotAiNode(Node):
     #     여기를 61.9로 잡으면 로봇이 도달 못 하는 목표가 만들어져서
     #     J3가 리밋에 걸린 채 위치 오차가 계속 남게 됨(전수검사로 확인).
     WS_D_MIN_MM = 132.0       # J3 리밋(+50°)에서의 실제 최소 도달거리 124.1mm + 여유
-    WS_D_MAX_MM = 258.0       # 도달 한계(277.9mm)의 약 93%
+    #
+    # [258 → 268 상향]  매핑 상자의 꼭짓점이 이 구각 밖에 있어서 생기던
+    # "멀쩡한 자세인데 WORKSPACE EDGE" 문제의 직접 원인이었다. 실측 계산:
+    #
+    #     자세          x     z      D        258 기준     268 기준
+    #     중립         198   255   211.5      OK           OK
+    #     최대 앞      250   255   254.8      OK           OK
+    #     최대 위      198   330   263.7      6mm 초과 ✗   OK
+    #     앞+위 동시   250   330   299.6     42mm 초과 ✗  32mm 초과 ✗
+    #
+    # 즉 팔을 끝까지 위로 드는 것만으로 이미 구각을 6mm 넘겨서 클램프가
+    # 걸렸다. 268이면 "최대 위"가 들어온다. "앞+위 동시"는 268로도 못
+    # 들어오는데, 이건 상수로 풀 문제가 아니라 매핑 상자가 구각(도넛)
+    # 모양과 안 맞아서 생기는 구조적 한계다 — 아래 MAP_* 주석 참고.
+    #
+    # ⚠ 268은 도달 한계(277.9mm)의 96.4%다. 경계에 가까울수록 arccos 인자가
+    #   ±1에 붙어서 목표점 1mm 이동이 큰 관절 변화가 된다(D=254.8에서 1.63°/mm,
+    #   D=263.5에서 2.03°/mm). 이 민감도 증가는 아래 CART_EXT_* 의 뻗음 적응
+    #   스무딩이 상쇄하도록 설계돼 있다. 둘은 세트이므로 CART_EXT_* 를 끄면
+    #   이 값도 258로 되돌릴 것.
+    WS_D_MAX_MM = 268.0       # 도달 한계(277.9mm)의 약 96%
 
     # J1 축(베이스 수직축) 바로 위 원기둥형 데드존.
     # r → 0 이면 atan2(y, x)의 방향이 정의되지 않아 J1이 노이즈로 미쳐 날뜀.
@@ -227,6 +270,22 @@ class MirobotAiNode(Node):
     WS_Z_MIN_MM = 40.0
     WS_Z_MAX_MM = 340.0
 
+    # ── WORKSPACE EDGE 표시 기준 ─────────────────────────────────────────
+    # 기존에는 클램프가 0.001mm만 잘라내도 배지가 떴다. 필터 출력이 경계를
+    # 스치기만 해도 EDGE 가 깜빡여서, 실제로 범위를 벗어난 것인지 아닌지
+    # 화면만 봐서는 구분할 수 없었다.
+    # → 실제로 잘려나간 거리가 ON 이상일 때만 EDGE 로 보고, OFF 아래로
+    #   내려오면 해제한다(히스테리시스로 깜빡임 방지).
+    #
+    # [중요] EDGE 는 발행을 막지 않는다. 발행 게이트에는 이 조건이 없다.
+    #   클램프된 목표점도 도달 가능한 유효 목표이므로 그대로 내보내는 것이
+    #   맞다. EDGE 상태에서 로봇이 안 움직이는 것처럼 보이는 이유는 명령이
+    #   막혀서가 아니라 목표점이 경계에 고정되기 때문이다.
+    WS_EDGE_ON_MM  = 3.0
+    WS_EDGE_OFF_MM = 1.0
+    # 어떤 제약이 얼마나 잘랐는지 주기적으로 로그에 남긴다(초). 0이면 끔.
+    WS_EDGE_LOG_PERIOD_SEC = 2.0
+
     # ══════════════════════════════════════════════════════
     #  3) 사람 → 로봇 매핑
     #
@@ -242,6 +301,10 @@ class MirobotAiNode(Node):
 
     # 캘리브레이션 전 기본 추정치 (무차원, 팔길이로 정규화된 값)
     #   팔을 곧게 아래로 내리면 up ≈ -1.0, 앞으로 수평이면 fwd ≈ 1.0
+    # 사람 팔 길이의 물리적 범위(m). 이 밖의 값은 추정 실패로 보고 버린다.
+    ARM_LEN_SANE_MIN = 0.25
+    ARM_LEN_SANE_MAX = 0.75
+
     # 캘리브레이션 중립 단계에서 측정해 고정하는 팔 길이(m).
     #  [왜 고정하는가] MediaPipe가 재는 팔 길이는 자세에 따라 크게 변한다.
     #  팔을 앞으로 뻗으면 투영 단축으로 짧게(0.30m), 옆으로 벌리면 길게(0.46m)
@@ -369,14 +432,39 @@ class MirobotAiNode(Node):
     WRIST_ANGLE_FRONT    = -35.0
     J5_BACK_BEND_SIGN    =   1.0   # 뒤/앞이 반대로 반응하면 -1.0
 
-    # ── J6 (툴 롤): 이번 버전에서는 비활성 ────────────────────────────────
-    # 손등 너클 라인(검지 MCP↔새끼 MCP)의 롤 성분으로 계산하는 코드는 다 들어있고,
-    # J1~J3 IK가 안정된 것을 확인한 뒤 True로 바꾸면 됨.
-    # 한 번에 다 켜면 문제가 생겼을 때 원인 분리가 안 되므로 기본 False.
+    # ── J6 (툴 롤): 전완 축 기준 3D 롤 ────────────────────────────────────
+    # [v1 → v2 변경 이유]
+    # v1은 화면상 너클선 각도 atan2(Δy, Δx) 를 J6 로 썼는데 세 가지가 겹쳐
+    # "중간이 없고 좌우 끝으로만 슬램하는" 증상이 났다.
+    #
+    #   1) ±180 랩어라운드: atan2 는 -180~180 을 돌려주는데 이걸 ±90 으로
+    #      그냥 잘랐다. 너클선이 -x 방향을 지나는 순간 +180 → -180 으로 튀고,
+    #      클램프를 거치면 +90 → -90 이 되어 한 프레임에 끝에서 끝으로 이동.
+    #   2) 기준점 없음: 절대 화면 각도라 중립 자세에서 이미 포화 구간(>90)에
+    #      앉아 있었다. 그래서 조금만 움직여도 ±90 사이만 오갔다.
+    #   3) 필터가 랩어라운드하는 값에 걸려 있어 +175 와 -175 의 평균을 0
+    #      (물리적으로 정반대 방향)으로 계산했다.
+    #
+    # v2는 전완을 회전축으로 두고 그 둘레의 각을 3D 로 잰다.
+    #   - 팔을 어디로 뻗든 '손목 비틀기'만 잡힌다 (화면 각도가 아니므로)
+    #   - 투영 단축의 영향을 안 받는다 (3D 이므로)
+    #   - J5(꺾기)와 직교한다. J5 는 축에 수직인 성분, J6 는 축 둘레의 성분.
+    #   - 중립 기준각을 캘리브레이션에서 재서 빼므로 중립이 0 이 된다.
+    #   - 언랩 → 필터 → 클램프 순서라 슬램이 원리적으로 사라진다.
     ENABLE_J6 = False
+
+    # 부호. 손을 어느 쪽으로 비틀 때 그리퍼가 어느 쪽으로 도는지는 실기로만
+    # 알 수 있다. 아래 [J6] 로그로 확인하고, 반대면 -1.0 으로 바꿀 것.
     J6_SIGN = 1.0
     J6_MAX_DEG = 90.0
-    MIN_KNUCKLE_VEC = 0.03   # 이보다 짧으면 foreshortening → 직전 값 홀드
+
+    # 캘리브레이션 중립 단계에서 측정하는 기준 롤(도). 0 이면 미측정.
+    # 미측정 상태에서는 절대 롤에서 첫 유효 프레임 값을 기준으로 삼는다
+    # (캘리브 없이도 최소한 슬램은 나지 않도록).
+    CAL_J6_REF = 0.0
+    CAL_J6_REF_SET = False
+
+    J6_DEBUG_PERIOD_SEC = 2.0   # [J6] 실측 범위 로그 주기(초). 0이면 끔
 
     # ══════════════════════════════════════════════════════
     #  5) 안정성 가드
@@ -513,7 +601,7 @@ class MirobotAiNode(Node):
     #  포화되어(중립 0.660 → 전방 0.726, 차이 0.066) 캘리브레이션 2단계가
     #  통과하지 못했는데, 보정 후에는 0.540 → 0.971(차이 0.430)로 정상화된다.
     ENABLE_GRU_CORRECTION = True
-    GRU_MODEL_FILENAME = 'gru_4sess_val-s2_h64s40.npz'   # ai_node_new.py 와 같은 폴더
+    GRU_MODEL_FILENAME = 'gru_both_geo_rad1_uncsoft2.npz'   # ai_node_new.py 와 같은 폴더
     #  hidden state가 0에서 출발한 직후 몇 프레임은 출력을 믿을 수 없다.
     #  이 구간에는 보정을 적용하지 않고 원본을 그대로 통과시킨다
     #  (리셋/호밍 직후 로봇이 튀는 것을 막는 안전장치).
@@ -542,6 +630,55 @@ class MirobotAiNode(Node):
     CART_MIN_CUTOFF = 1.2
     CART_BETA       = 0.015
     CART_D_CUTOFF   = 1.0
+
+    # cutoff 상한(Hz). None 이면 비활성(기존 동작).
+    #
+    # [측정 결과 — 기본 비활성으로 둔 이유]
+    # "노이즈가 스스로를 빠른 움직임으로 위장해 스무딩을 풀어버린다"는 되먹임을
+    # 막으려고 넣었는데, 실제로 재보니 현재 beta=0.015 에서는 그 되먹임이
+    # 거의 없다. 실효 cutoff 가 입력 노이즈 2mm→1.32Hz, 20mm→2.21Hz 로만
+    # 올라가서 상한 3.0 이 애초에 잘 안 걸린다.
+    #
+    #   상한값     500mm/s 급속동작 추종오차     정지 시 떨림
+    #   없음              24.5mm                 2.22
+    #   4.0               26.7mm                 2.22
+    #   3.0               28.4mm                 2.22   ← 떨림 이득 0, 지연만 +3.9mm
+    #   2.0               31.3mm                 2.09
+    #
+    # 즉 떨림은 전혀 안 줄고 빠른 동작 지연만 붙는다. 기본은 끈다.
+    # 나중에 CART_BETA 를 크게 올릴 일이 생기면 그때 3.0~4.0 으로 켤 것
+    # (beta 가 커지면 되먹임이 실제로 생기므로 그때는 상한이 의미가 있다).
+    CART_MAX_CUTOFF = None
+
+    # ── 뻗음 적응 (팔을 멀리 뻗을수록 스무딩·데드밴드를 강화) ─────────────
+    # [문제] 중립 근처는 안정적인데 멀리 뻗으면 미세하게 계속 떨리는 현상.
+    #
+    # [원인] 두 가지가 곱해진다.
+    #   1) 입력 노이즈가 커진다. 팔이 카메라 쪽을 향할수록 투영 단축
+    #      (foreshortening) 때문에 깊이 추정이 나빠지고, 그 노이즈에 매핑
+    #      게인(g_fwd, g_up)이 곱해져 mm 단위로 증폭된다.
+    #   2) 같은 mm 오차가 더 큰 관절 변화가 된다. 구각 경계에 가까울수록
+    #      IK 민감도가 올라간다(D=175mm에서 0.93°/mm → D=263mm에서 2.03°/mm).
+    #   그 결과 손을 멈춰도 고정 4mm 데드밴드를 매 프레임 넘겨서
+    #   초당 9.5회 × 회당 6.8°의 헛명령이 나간다(시뮬레이션 실측).
+    #
+    # [대책] 뻗은 정도에 비례해 (a) 중앙값 창을 넓히고 (b) min_cutoff를 낮추고
+    #        (c) 데드밴드를 넓힌다. 셋 다 KNEE 아래에서는 계수가 0이므로
+    #        중립 근처 동작은 수정 전과 완전히 동일하다.
+    #
+    #   측정(입력노이즈 12mm, D/Dmax≈0.97, 손 정지 상태):
+    #     현재            발행 9.5회/초,  헛움직임 64.2°/초,  추종오차 5.0mm
+    #     적응 적용 후     발행 2.2회/초,  헛움직임 20.6°/초,  추종오차 5.7mm
+    #
+    # 뻗음 비율 = (J2축~목표점 거리 D) / WS_D_MAX_MM. 이 값이 KNEE 를 넘는
+    # 구간에서 0→1 로 선형 상승하는 계수를 만들어 아래 세 값에 적용한다.
+    CART_EXT_KNEE           = 0.85   # 이 비율부터 적응 시작 (D≈228mm)
+    CART_EXT_CUTOFF_SCALE   = 0.35   # 최대 뻗음에서 min_cutoff 를 이 배율로
+    CART_EXT_DEADBAND_SCALE = 2.0    # 최대 뻗음에서 데드밴드를 이 배율로
+    CART_MEDIAN_WINDOW_MAX  = 5      # 최대 뻗음에서의 중앙값 창
+    #
+    # 되돌리려면: CUTOFF_SCALE=1.0, DEADBAND_SCALE=1.0, WINDOW_MAX=CART_MEDIAN_WINDOW
+    # 로 두면 적응이 전부 무효화된다(코드 경로는 그대로 살아있음).
 
     # ── 카테시안 중앙값 사전필터 창 크기 ─────────────────────────────────
     # [측정 결과 — 지연의 최대 단일 원인]
@@ -580,7 +717,81 @@ class MirobotAiNode(Node):
     DEADBAND_J6      = 2.0
     DEADBAND_GRIPPER = 1.0
 
-    # 핀치 판정 비율 (v1 그대로 유지)
+    # ── 그리퍼 핀치 판정 ─────────────────────────────────────────────────
+    # [설계 변경] v1의 연속 보간(핀치 비율 → S35~S58 선형)을 2단(열림/닫힘)
+    # 상태 기계로 바꿈.
+    #
+    # [이유] 손을 오므리면 엄지·검지가 손바닥에 가려지면서 MediaPipe가 두
+    # 랜드마크를 추정으로 찍는다. 연속 보간에서는 그 추정 흔들림이 그대로
+    # 명령값 변동이 되어, 사용자는 손을 가만히 쥐고 있는데 그리퍼가 혼자
+    # 열렸다 닫혔다를 반복했다. 데드밴드 1.0으로는 못 막는다 — 흔들림 폭이
+    # 그보다 크기 때문.
+    #
+    # 핀치 그리퍼는 어차피 물체를 잡거나 놓거나 둘 중 하나라 중간 개도의
+    # 실용적 가치가 거의 없다. 2단으로 두면 중간 구간이 통째로 사라진다.
+    #
+    # [구조] 세 겹으로 막는다.
+    #   1) 히스테리시스: CLOSE_ENTER 아래면 닫힘 후보, OPEN_ENTER 위면 열림
+    #      후보, 그 사이(0.38~0.62)는 어느 쪽도 아니고 현재 상태를 유지한다.
+    #      이 중간 구간이 채터링을 죽이는 핵심.
+    #   2) 확정 프레임: 후보가 CONFIRM_FRAMES 연속으로 같아야 실제로 뒤집힌다.
+    #      (J5 부호 확정과 같은 방식)
+    #   3) 동결: world 랜드마크가 없는 프레임(손 미검출, 또는 MediaPipe 가
+    #      multi_hand_world_landmarks 를 안 준 경우)에는 후보 카운트조차
+    #      올리지 않고 현재 상태를 붙잡는다. 여기서 열림으로 되돌리면
+    #      물건을 떨구므로 '모르면 유지'가 옳다.
+    #      v1 의 hand_size 가드는 제거했다 — 손바닥 크기를 재는 값이라
+    #      손가락 가림을 못 잡으면서 프레임 절반을 동결시키기만 했다.
+    #
+    # ── [v2] 2D 비율 → 3D 절대거리 ────────────────────────────────────────
+    # v1의 판정식 pinch_ratio = d2(4,8) / d2(0,9) 를 버리고 world 좌표의
+    # 절대 거리 d3(4,8) [m] 를 쓴다.
+    #
+    # [이유] 5개 세션 실측. '단축 구간'과 '정상 구간'은 손 모양이 같고 팔
+    # 자세만 다르므로, 좋은 신호라면 값이 안 변해야 한다.
+    #
+    #   신호                        평균 변동   구간내 CV
+    #   2D  d2(4,8)/d2(0,9)          25%       215%   ← 현재
+    #   3D  d3(4,8)/d3(0,9)          14%        29%
+    #   3D  d3(4,8) [m] 절대          10%        28%   ← 채택
+    #
+    # CV 215% 가 핵심이다. 분모 d2(0,9) 는 손바닥이 카메라를 정면으로 향하면
+    # 2D 에서 한 점으로 뭉개져 0 에 가까워지고, 그때 비율이 폭발한다.
+    # (session1 은 CV 488%) 어떤 임계값을 잡아도 못 버틴다. 손 절반이
+    # PINCH_MIN_HAND_SIZE 가드에 걸렸던 것도 같은 현상이고, 그래서 상태가
+    # 동결된 채 "아예 닫혀버리는" 증상이 났다.
+    # 절대 거리는 분모가 없어 이 실패 모드가 원리적으로 사라진다.
+    #
+    # [대가] 손 크기 개인차가 그대로 들어온다. 5개 세션 정상 구간 중앙값이
+    # 0.041~0.048m 로 개인차보다 세션 내 변동이 오히려 컸지만, 심사 때 다른
+    # 사람이 잡을 것을 대비해 임계값은 실측으로 잡아야 한다.
+    #
+    # ★ 임계값 두 개는 반드시 실측으로 잡을 것 ★
+    #   GRU_DEBUG_LOG 가 켜져 있으면 [핀치] 로그에 최근 구간의 d3(4,8) 최소/
+    #   최대가 mm 단위로 찍힌다. 손을 완전히 오므린 채 몇 초, 완전히 편 채
+    #   몇 초 유지하면서 두 구간의 범위를 읽고,
+    #     PINCH_CLOSE_ENTER_M ← 오므렸을 때 최댓값보다 살짝 위
+    #     PINCH_OPEN_ENTER_M  ← 폈을 때 최솟값보다 살짝 아래
+    #   로 두면 된다. 두 값 간격이 좁으면 채터링이 돌아온다 — 최소 0.015m.
+    #
+    #   아래 기본값의 근거와 한계:
+    #     5개 세션 '정상 구간' d3(4,8) 중앙값이 41~48mm 였다. 다만 촬영 때
+    #     손 모양을 지정하지 않았으므로 이건 '임의의 손 모양'의 값이지
+    #     '완전히 편 상태'가 아니다. 그리고 '오므린 상태'의 실측값은 데이터에
+    #     아예 없다.
+    #     → 열림 기준을 그 범위보다 위(예: 50mm)에 두면 열림이 영영 확정되지
+    #       않으므로, 관측된 범위 안쪽인 45mm 로 둔다. 닫힘은 그보다 20mm
+    #       아래인 25mm. 어디까지나 "상태 기계가 양쪽에 도달은 할 수 있는"
+    #       출발점이며, 정확한 값이 아니다. 반드시 로그로 다시 잡을 것.
+    GRIPPER_BINARY         = True    # False 면 v1 2D 연속 보간으로 되돌아감
+    PINCH_CLOSE_ENTER_M    = 0.025   # 이 아래 → 닫힘 후보 (m)  ※ 실측 필요
+    PINCH_OPEN_ENTER_M     = 0.045   # 이 위   → 열림 후보 (m)  ※ 실측 필요
+    GRIPPER_CONFIRM_FRAMES = 4       # 연속 몇 프레임 같아야 상태를 뒤집는가
+    GRIPPER_CLOSED_S       = 58.0
+    GRIPPER_OPEN_S         = 35.0
+    PINCH_DBG_PERIOD_SEC   = 2.0     # [핀치] 실측 범위 로그 주기(초). 0이면 끔
+
+    # 연속 보간 폴백(GRIPPER_BINARY=False)에서만 쓰임 — 2D 방식 그대로
     PINCH_CLOSE_RATIO = 0.38
     PINCH_OPEN_RATIO  = 0.70
 
@@ -651,7 +862,7 @@ class MirobotAiNode(Node):
 
     GESTURE_MIN_PALM_WIDTH_RATIO = 0.55
     GESTURE_MIN_FIST_WIDTH_RATIO = 0.35
-    GESTURE_OPEN_MIN_FINGERS     = 4
+    GESTURE_OPEN_MIN_FINGERS     = 5
     GESTURE_CLOSED_MAX_FINGERS   = 1
 
     # ── 캘리브레이션 ─────────────────────────────────────────────────────────
@@ -760,6 +971,25 @@ class MirobotAiNode(Node):
         self.calib_next_stage_idx = 0
         self.calib_samples_pos   = []   # (fwd, lat, up) 정규화 좌표 샘플
         self.calib_samples_arm   = []   # 팔 길이 샘플(m) — 중립 단계에서만 사용
+        self.calib_samples_j6    = []   # J6 기준 롤 샘플(도) — 중립 단계에서만 사용
+
+        # ══════════════════════════════════════════════════════════════════
+        #  [상태 변수] J6 롤
+        #
+        #  CAL_J6_REF / CAL_J6_REF_SET — 중립 기준 롤. 캘리브레이션에서
+        #    확정하되, 캘리브 전에도 첫 유효 프레임을 임시 기준으로 잡아
+        #    슬램이 나지 않게 한다.
+        #  j6_unwrap_prev — 언랩 연속성을 위한 직전 출력. 이게 낡은 값으로
+        #    남으면 리셋 직후 첫 프레임에서 ±360 이 잘못 더해져 J6 가 한계로
+        #    튄다. 반드시 _hard_reset_control_state() 에서 None 으로 비운다.
+        # ══════════════════════════════════════════════════════════════════
+        self.CAL_J6_REF     = MirobotAiNode.CAL_J6_REF
+        self.CAL_J6_REF_SET = MirobotAiNode.CAL_J6_REF_SET
+        self.calib_j6_from_calib = False   # 로그 표시용 (캘리브 확정값인가)
+        self.j6_unwrap_prev = None
+        self.j6_dbg_t   = 0.0
+        self.j6_dbg_min = float('inf')
+        self.j6_dbg_max = float('-inf')
         self.calib_samples_wrist = []   # effective_bend(손목) 샘플
         self.calib_prep_until = 0.0
         self.last_calib_status_pub_time = 0.0
@@ -838,12 +1068,19 @@ class MirobotAiNode(Node):
         #  [v2] 카테시안 파이프라인 상태
         #  필터를 관절각이 아니라 목표점(mm)에 거는 이유는 상수 섹션 주석 참고.
         # ══════════════════════════════════════════════════════════════════
-        self.f_cx = OneEuroFilter(self.CART_MIN_CUTOFF, self.CART_BETA, self.CART_D_CUTOFF)
-        self.f_cy = OneEuroFilter(self.CART_MIN_CUTOFF, self.CART_BETA, self.CART_D_CUTOFF)
-        self.f_cz = OneEuroFilter(self.CART_MIN_CUTOFF, self.CART_BETA, self.CART_D_CUTOFF)
-        self.m_cx = MedianPrefilter(window=self.CART_MEDIAN_WINDOW)
-        self.m_cy = MedianPrefilter(window=self.CART_MEDIAN_WINDOW)
-        self.m_cz = MedianPrefilter(window=self.CART_MEDIAN_WINDOW)
+        self.f_cx = OneEuroFilter(self.CART_MIN_CUTOFF, self.CART_BETA,
+                                  self.CART_D_CUTOFF, self.CART_MAX_CUTOFF)
+        self.f_cy = OneEuroFilter(self.CART_MIN_CUTOFF, self.CART_BETA,
+                                  self.CART_D_CUTOFF, self.CART_MAX_CUTOFF)
+        self.f_cz = OneEuroFilter(self.CART_MIN_CUTOFF, self.CART_BETA,
+                                  self.CART_D_CUTOFF, self.CART_MAX_CUTOFF)
+        # 버퍼는 최대 창 크기로 잡고, 실제 사용 개수는 매 프레임 뻗음 정도에
+        # 따라 filter(x, window) 로 정한다. 중립 근처에서는 CART_MEDIAN_WINDOW
+        # 개만 쓰므로 기존 지연 특성이 그대로 유지된다.
+        _mw = max(self.CART_MEDIAN_WINDOW, self.CART_MEDIAN_WINDOW_MAX)
+        self.m_cx = MedianPrefilter(window=_mw)
+        self.m_cy = MedianPrefilter(window=_mw)
+        self.m_cz = MedianPrefilter(window=_mw)
 
         # J5 / J6은 IK와 무관한 독립 축이므로 v1 파이프라인 유지
         self.f_j5 = OneEuroFilter(self.J5_MIN_CUTOFF, self.J5_BETA, self.D_CUTOFF)
@@ -918,6 +1155,40 @@ class MirobotAiNode(Node):
 
         self.last_joint_pub_time   = 0.0
         self.last_gripper_pub_time = 0.0
+
+        # ══════════════════════════════════════════════════════════════════
+        #  [상태 변수] 그리퍼 2단 상태 기계
+        #
+        #  gripper_closed 는 '직전까지 확정된 개폐 상태'다. None 이면 아직
+        #  한 번도 확정되지 않은 상태로, 이때는 그리퍼 명령을 내지 않는다.
+        #  gripper_cand / cnt 는 뒤집기 후보와 그 연속 프레임 수.
+        #
+        #  [호밍 안전] 셋 다 '직전 판정의 기억'이므로 _hard_reset_control_state()
+        #  에 등록되어 있다. 낡은 상태가 남으면 호밍/리셋 직후 첫 유효 프레임에서
+        #  실제 손 모양과 무관한 개폐 명령이 나갈 수 있다.
+        # ══════════════════════════════════════════════════════════════════
+        self.gripper_closed        = None
+        self.gripper_cand          = None
+        self.gripper_cand_cnt      = 0
+        self.pinch_last_valid_time = 0.0
+        # 임계값 튜닝용 실측 범위 (로그 전용, 제어 경로에서 읽지 않음)
+        self.pinch_dbg_t   = 0.0
+        self.pinch_dbg_min = float('inf')
+        self.pinch_dbg_max = float('-inf')
+
+        # ══════════════════════════════════════════════════════════════════
+        #  [상태 변수] 작업공간 EDGE 히스테리시스
+        #
+        #  ws_edge_active 는 배지 표시와 last_ik_ok 판정에만 쓰인다. 발행
+        #  게이트에는 들어가지 않으므로 이 값이 True 여도 명령은 계속 나간다.
+        #
+        #  [호밍 안전] 낡은 EDGE 상태가 남아도 명령값에는 영향이 없지만,
+        #  리셋 직후 화면에 이전 세션의 사유가 남아 오판을 유도하므로 함께 비운다.
+        # ══════════════════════════════════════════════════════════════════
+        self.ws_edge_active   = False
+        self.ws_clamp_reason  = ''
+        self.ws_clamp_mag     = 0.0
+        self.ws_edge_log_t    = 0.0
 
         # ══════════════════════════════════════════════════════════════════
         #  [지연 계측] 프레임 수신 → 관절명령 발행까지의 파이 내부 지연
@@ -1186,6 +1457,14 @@ class MirobotAiNode(Node):
         self.f_j6.reset(); self.m_j6.reset()
         self.tool_pitch_deg = self.TOOL_PITCH_STRAIGHT
         self.j6_deg = 0.0
+
+        # [호밍 안전] J6 언랩 연속성 기준. 이 값이 낡은 채로 남으면 리셋 직후
+        # 첫 프레임에서 ±360 이 잘못 더해져 J6 가 한쪽 한계로 튄다.
+        # (CAL_J6_REF 자체는 캘리브레이션 값이므로 여기서 안 건드린다 —
+        #  호밍 시에는 _reset_calibration_to_defaults() 가 따로 처리한다)
+        self.j6_unwrap_prev = None
+        self.j6_dbg_min = float('inf')
+        self.j6_dbg_max = float('-inf')
         self.j5_last_valid_time = 0.0
         # [상태 변수] 2D palm 방식 각도 unwrap 및 기준축 상태.
         #   모두 '직전 궤적의 기억'이므로 호밍/리셋 시 반드시 비운다.
@@ -1213,6 +1492,26 @@ class MirobotAiNode(Node):
         #  동안은 보정 없이 원본이 통과된다(이중 안전장치).
         if self.corrector is not None:
             self.corrector.reset()
+
+        # 4-2) 그리퍼 2단 상태 기계 소거
+        #  [호밍 안전] gripper_closed 는 '직전까지 확정된 개폐 상태'다.
+        #  비우지 않으면 리셋 직후 첫 유효 프레임에서, 사용자의 현재 손 모양과
+        #  무관하게 이전 세션의 상태가 그대로 발행될 수 있다. None 으로 두면
+        #  새로 GRIPPER_CONFIRM_FRAMES 만큼 확정될 때까지 아무 명령도 안 나간다.
+        #  (그리퍼는 개폐만 하므로 명령을 안 내는 쪽이 항상 안전하다)
+        self.gripper_closed = None
+        self.gripper_cand = None
+        self.gripper_cand_cnt = 0
+        self.pinch_last_valid_time = 0.0
+        self.pinch_dbg_min = float('inf')
+        self.pinch_dbg_max = float('-inf')
+
+        # 4-3) 작업공간 EDGE 히스테리시스 소거
+        #  제어 경로에는 영향이 없지만(발행 게이트에 안 들어감), 리셋 후에도
+        #  이전 사유가 화면에 남으면 진단을 오도하므로 함께 비운다.
+        self.ws_edge_active = False
+        self.ws_clamp_reason = ''
+        self.ws_clamp_mag = 0.0
 
         # 5) IK 해 / 추적 상태 소거
         self.last_ik = None
@@ -1402,6 +1701,14 @@ class MirobotAiNode(Node):
 
     def _reset_calibration_to_defaults(self):
         self.CAL_ARM_LEN = MirobotAiNode.CAL_ARM_LEN
+        # J6 기준 롤도 사람이 바뀌는 시점(호밍)에 함께 버린다. 이전 사람의
+        # 중립 손목 각도를 그대로 쓰면 새 사람의 중립이 한쪽으로 치우친다.
+        # REF_SET 를 False 로 되돌리므로 다음 유효 프레임에서 임시 기준이
+        # 다시 잡히고, 캘리브레이션을 돌리면 정식 값으로 덮인다.
+        self.CAL_J6_REF     = MirobotAiNode.CAL_J6_REF
+        self.CAL_J6_REF_SET = MirobotAiNode.CAL_J6_REF_SET
+        self.calib_j6_from_calib = False
+        self.j6_unwrap_prev = None
         self.CAL_FWD_NEUTRAL = MirobotAiNode.CAL_FWD_NEUTRAL
         self.CAL_FWD_MAX     = MirobotAiNode.CAL_FWD_MAX
         self.CAL_UP_NEUTRAL  = MirobotAiNode.CAL_UP_NEUTRAL
@@ -1416,6 +1723,7 @@ class MirobotAiNode(Node):
         self.calib_next_stage_idx = 0
         self.calib_samples_pos = []
         self.calib_samples_arm = []
+        self.calib_samples_j6 = []
         self.calib_samples_wrist = []
         self.calib_prep_until = 0.0
 
@@ -1435,6 +1743,7 @@ class MirobotAiNode(Node):
                 self.calib_mode = self.CALIB_STAGES[self.calib_next_stage_idx]
                 self.calib_samples_pos = []
                 self.calib_samples_arm = []
+                self.calib_samples_j6 = []
                 self.calib_samples_wrist = []
                 # 버튼을 누른 직후는 아직 자세를 잡는 중이므로, 이 시각까지는
                 # 샘플을 모으지 않고 "준비 시간"으로만 사용함.
@@ -1558,6 +1867,109 @@ class MirobotAiNode(Node):
 
         f_signed *= self.J5_FLEX_ARM_SIGN.get(active_arm, 1.0)
         return (e_mag, f_signed)
+
+    def _j6_forearm_roll(self, world_lm, hand_world_lm, active_arm):
+        """전완 축을 중심으로 손바닥이 얼마나 돌았는지(도). 계산 불가면 None.
+
+        [왜 3D 롤인가]
+        v1은 화면상 너클선 각도 atan2(Δy, Δx)를 J6로 썼는데 두 가지가 틀렸다.
+          1) 화면 각도라서 손목을 안 비틀고 팔만 위아래로 들어도 값이 변한다.
+             너클선이 화면에서 회전하기 때문. J5(꺾기)와 값이 섞였다.
+          2) 팔을 뻗으면 너클선이 투영 단축으로 짧아져 각도가 불안정해진다.
+             (핀치·J5에서 겪은 것과 같은 패턴)
+
+        전완을 회전축으로 두고 그 축 둘레의 각만 재면 두 문제가 같이 사라진다.
+        팔을 어디로 뻗든 '손목 비틀기'만 남는다.
+
+        [J5와 직교하는 이유]
+        J5는 전완과 손바닥 장축 사이의 꺾인 각(축에 수직 성분),
+        J6는 전완 축 둘레의 회전(축에 나란한 성분). 서로 독립인 자유도라
+        한쪽이 변해도 다른 쪽 값이 따라 변하지 않는다.
+
+        정의:
+            f = 손목 - 팔꿈치        전완 = 회전축      (pose world, 미터)
+            k = P17 - P5             너클선             (hand world, 미터)
+            f 를 축으로 k 를 투영해, 기준 방향(전완에 수직인 위쪽)으로부터
+            잰 부호 있는 각.
+
+        기준 방향은 전완과 '몸통 위쪽'의 외적으로 만든다. 팔 자세가 변해도
+        같이 회전하므로, 결과는 팔 자세가 아니라 손목 비틀기에만 반응한다.
+
+        반환: -180~180 (도) — 절대 롤. 중립 기준 보정은 호출부에서 한다.
+        """
+        if world_lm is None or hand_world_lm is None:
+            return None
+
+        el_i = 13 if active_arm == 'right' else 14
+        wr_i = 15 if active_arm == 'right' else 16
+        try:
+            ew, ww = world_lm[el_i], world_lm[wr_i]
+            p5, p17 = hand_world_lm[5], hand_world_lm[17]
+        except (IndexError, TypeError):
+            return None
+
+        # 회전축 = 전완 (팔꿈치 → 손목)
+        ax, ay, az = ww.x - ew.x, ww.y - ew.y, ww.z - ew.z
+        am = math.sqrt(ax * ax + ay * ay + az * az)
+        if am < self.MIN_VEC3_J5:
+            return None
+        ax, ay, az = ax / am, ay / am, az / am
+
+        # 측정 대상 = 너클선
+        kx, ky, kz = p17.x - p5.x, p17.y - p5.y, p17.z - p5.z
+        if math.sqrt(kx * kx + ky * ky + kz * kz) < self.MIN_VEC3_J5:
+            return None
+
+        # 기준 방향 u: 전완축에 수직인 방향 하나를 정한다.
+        # 월드 '위쪽'(-y, MediaPipe world 는 y가 아래로 증가)과 전완의 외적.
+        # 전완이 위쪽과 거의 나란하면(팔을 수직으로 들면) 외적이 0에 가까워져
+        # 방향이 정의되지 않으므로, 그때는 +z(카메라 앞) 를 대신 쓴다.
+        ux, uy, uz = self._cross3(0.0, -1.0, 0.0, ax, ay, az)
+        if math.sqrt(ux * ux + uy * uy + uz * uz) < 0.15:
+            ux, uy, uz = self._cross3(0.0, 0.0, 1.0, ax, ay, az)
+        um = math.sqrt(ux * ux + uy * uy + uz * uz)
+        if um < 1e-9:
+            return None
+        ux, uy, uz = ux / um, uy / um, uz / um
+
+        # v = a × u  (u, v, a 가 오른손 직교계를 이룸)
+        vx, vy, vz = self._cross3(ax, ay, az, ux, uy, uz)
+
+        # 너클선에서 축 성분을 빼고 u-v 평면에 투영
+        kd = kx * ax + ky * ay + kz * az
+        px, py, pz = kx - kd * ax, ky - kd * ay, kz - kd * az
+        if math.sqrt(px * px + py * py + pz * pz) < 1e-9:
+            # 너클선이 전완축과 거의 나란함 → 롤이 정의되지 않음
+            return None
+
+        return math.degrees(math.atan2(px * vx + py * vy + pz * vz,
+                                       px * ux + py * uy + pz * uz))
+
+    @staticmethod
+    def _cross3(ax, ay, az, bx, by, bz):
+        return (ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx)
+
+    @staticmethod
+    def _wrap180(deg):
+        """각도를 (-180, 180] 으로 감아 내린다."""
+        return (deg + 180.0) % 360.0 - 180.0
+
+    def _j6_unwrap(self, deg):
+        """직전 출력에 이어지도록 ±360 을 더해 연속으로 만든다.
+
+        [왜 필요한가]  atan2 는 ±180 에서 불연속이다. 손을 조금 돌렸을 뿐인데
+        +179 → -179 로 358도가 튀고, 그 값을 클램프하면 J6 가 한 프레임에
+        한쪽 끝에서 반대쪽 끝으로 슬램한다. 필터에 넣으면 두 값의 평균이
+        0(정반대 방향)으로 나와 더 나빠진다.
+        → 언랩해서 연속으로 만든 뒤에 필터와 클램프를 적용해야 한다.
+        """
+        if self.j6_unwrap_prev is None:
+            self.j6_unwrap_prev = deg
+            return deg
+        d = self._wrap180(deg - self.j6_unwrap_prev)
+        out = self.j6_unwrap_prev + d
+        self.j6_unwrap_prev = out
+        return out
 
     @staticmethod
     def _joint_angle_2d(a, b, c):
@@ -1741,20 +2153,32 @@ class MirobotAiNode(Node):
         경계에 닿았을 때 '정지'가 아니라 '경계를 따라 미끄러지도록(투영)' 함 —
         사용자가 팔을 더 뻗어도 로봇이 갑자기 멈추지 않아 이질감이 적음.
 
-        반환: (x, y, z, clamped_bool)
+        [반환값 확장] 예전에는 잘렸는지 여부(bool)만 돌려줘서, 화면에
+        WORKSPACE EDGE 가 떠도 "어느 제약이 얼마나 잘랐는지"를 알 수 없었다.
+        이제 사유와 실제 변위량(mm)을 함께 돌려주므로, 배지와 로그만 보고
+        어떤 상수를 손봐야 하는지 바로 판단할 수 있다.
+
+        반환: (x, y, z, clamped_bool, reason_str, magnitude_mm)
         """
+        x0, y0, z0 = x, y, z
         clamped = False
+        reason = ''
+
+        def _mark(tag):
+            # 여러 제약이 동시에 걸리면 마지막(더 안쪽) 것까지 이어서 표기
+            nonlocal reason
+            reason = tag if not reason else f'{reason}+{tag}'
 
         # 1) 높이 한계
         if z < self.WS_Z_MIN_MM:
-            z = self.WS_Z_MIN_MM; clamped = True
+            z = self.WS_Z_MIN_MM; clamped = True; _mark('Z_MIN')
         elif z > self.WS_Z_MAX_MM:
-            z = self.WS_Z_MAX_MM; clamped = True
+            z = self.WS_Z_MAX_MM; clamped = True; _mark('Z_MAX')
 
         # 2) 앞쪽 반공간 강제 — J1의 ±180° 불연속 점프를 원리적으로 차단
         if x < self.WS_X_MIN_MM:
             x = self.WS_X_MIN_MM
-            clamped = True
+            clamped = True; _mark('X_MIN')
 
         # 3) 방위각(J1) 제한 — 위에서 x>0을 보장했으므로 여기서 각도가 감기지 않음
         yaw = math.atan2(y, x)
@@ -1763,7 +2187,7 @@ class MirobotAiNode(Node):
             yaw = max(-yaw_max, min(yaw_max, yaw))
             rr = math.hypot(x, y)
             x, y = rr * math.cos(yaw), rr * math.sin(yaw)
-            clamped = True
+            clamped = True; _mark('YAW')
 
         # 4) J1 축 데드존 — r이 0에 가까우면 방위각이 정의되지 않아 J1이 폭주함
         r = math.hypot(x, y)
@@ -1775,7 +2199,7 @@ class MirobotAiNode(Node):
                 s = self.WS_R_MIN_XY_MM / r
                 x, y = x * s, y * s
             r = self.WS_R_MIN_XY_MM
-            clamped = True
+            clamped = True; _mark('R_MIN')
 
         # 5) J2 축 중심의 구각(shell) 안으로 투영
         #    J2 축은 (r = a1, z = d1) 위치에 있고, 손목중심은 그 점에서
@@ -1787,15 +2211,15 @@ class MirobotAiNode(Node):
         if D < 1e-6:
             # 정확히 J2 축 위 — 방향이 없으므로 정면 최소거리로 밀어냄
             R, Z, D = self.WS_D_MIN_MM, 0.0, self.WS_D_MIN_MM
-            clamped = True
+            clamped = True; _mark('D_MIN')
         elif D < self.WS_D_MIN_MM:
             s = self.WS_D_MIN_MM / D
             R, Z, D = R * s, Z * s, self.WS_D_MIN_MM
-            clamped = True
+            clamped = True; _mark('D_MIN')
         elif D > self.WS_D_MAX_MM:
             s = self.WS_D_MAX_MM / D
             R, Z, D = R * s, Z * s, self.WS_D_MAX_MM
-            clamped = True
+            clamped = True; _mark('D_MAX')
 
         if clamped:
             r_new = R + self.LINK_A1_MM
@@ -1811,7 +2235,10 @@ class MirobotAiNode(Node):
             #  arccos 인자를 다시 클램프하므로 발산하지 않음)
             z = max(self.WS_Z_MIN_MM, min(self.WS_Z_MAX_MM, z))
 
-        return x, y, z, clamped
+        # 실제로 목표점이 얼마나 밀려났는지(mm). 배지/로그 판정에 쓰인다.
+        mag = math.sqrt((x - x0) ** 2 + (y - y0) ** 2 + (z - z0) ** 2) if clamped else 0.0
+
+        return x, y, z, clamped, reason, mag
 
     def _ik_position(self, x, y, z):
         """
@@ -1934,6 +2361,7 @@ class MirobotAiNode(Node):
         self.calib_next_stage_idx = current_idx
         self.calib_samples_pos = []
         self.calib_samples_arm = []
+        self.calib_samples_j6 = []
         self.calib_samples_wrist = []
         self._publish_calib_status(
             force=True,
@@ -1976,6 +2404,37 @@ class MirobotAiNode(Node):
                         self.get_logger().warn(
                             f"[캘리브레이션] 팔 길이 측정값이 너무 작습니다"
                             f"({med*1000:.0f}mm) — 실시간 추정으로 대체합니다.")
+
+                # ── J6 기준 롤 확정 ──────────────────────────────────────
+                # 중립 자세에서 전완 축 둘레의 손바닥 각도를 재서, 이후 J6 를
+                # "중립 대비 얼마나 비틀었나"로 만든다. 절대 롤을 그대로 쓰면
+                # 중립에서 이미 한쪽으로 치우쳐 있어 가동 범위가 반쪽이 된다.
+                #
+                # 중앙값을 쓰는 이유는 팔 길이와 같다 — 자세를 잡는 과도기
+                # 프레임이 섞여 있어 평균은 그 영향을 받는다.
+                # 각도는 ±180 에서 감기므로 단순 중앙값이 위험할 수 있으나,
+                # 중립 자세 2초간의 샘플은 한 곳에 모여 있어 경계를 걸칠
+                # 가능성이 낮다. 대신 퍼짐이 크면 경고를 띄운다.
+                if len(self.calib_samples_j6) >= 5:
+                    arr = sorted(self.calib_samples_j6)
+                    med_j6 = arr[len(arr) // 2]
+                    spread = max(abs(self._wrap180(a - med_j6)) for a in arr)
+                    if spread > 60.0:
+                        self.get_logger().warn(
+                            f"[캘리브레이션] J6 기준 롤 샘플이 너무 흩어져 있습니다"
+                            f"(±{spread:.0f}°) — 손목을 고정한 채 다시 재보세요. "
+                            f"일단 {med_j6:+.1f}° 로 설정합니다.")
+                    self.CAL_J6_REF = med_j6
+                    self.CAL_J6_REF_SET = True
+                    self.calib_j6_from_calib = True
+                    self.j6_unwrap_prev = None   # 기준이 바뀌었으므로 언랩 재시작
+                    self.get_logger().info(
+                        f"[캘리브레이션] J6 기준 롤 확정 {med_j6:+.1f}° "
+                        f"(샘플 {len(arr)}개, 퍼짐 ±{spread:.0f}°)")
+                elif self.ENABLE_J6:
+                    self.get_logger().warn(
+                        "[캘리브레이션] J6 기준 롤 샘플이 부족합니다 — "
+                        "임시 기준을 그대로 씁니다.")
 
                 self.get_logger().info(
                     f"[캘리브레이션] 중립 fwd={avg_fwd:.3f} lat={avg_lat:.3f} up={avg_up:.3f}")
@@ -2028,6 +2487,7 @@ class MirobotAiNode(Node):
         self.calib_mode = None
         self.calib_samples_pos = []
         self.calib_samples_arm = []
+        self.calib_samples_j6 = []
         self.calib_samples_wrist = []
 
         if current_idx + 1 < len(self.CALIB_STAGES):
@@ -2428,6 +2888,7 @@ class MirobotAiNode(Node):
         norm_fwd = norm_lat = norm_up = None
         pos_valid = False
         raw_arm_len = None      # 이번 프레임에서 관측된 팔 길이(캘리브 수집용)
+        el_raw = wr_raw = None  # GRU 보정 전 원본 (팔 길이 계산용)
 
         if active_arm is not None and world_lm is not None:
             lm = pose_results.pose_landmarks.landmark
@@ -2491,21 +2952,40 @@ class MirobotAiNode(Node):
                         self.get_logger().warn(f"[GRU 보정] 실행 오류 — 이후 비활성화: {e}")
                     self.corrector = None
 
-            ua = math.sqrt((el_p[0] - sh_p[0]) ** 2 + (el_p[1] - sh_p[1]) ** 2 + (el_p[2] - sh_p[2]) ** 2)
-            fa = math.sqrt((wr_p[0] - el_p[0]) ** 2 + (wr_p[1] - el_p[1]) ** 2 + (wr_p[2] - el_p[2]) ** 2)
+            # 팔 길이는 반드시 GRU 보정 전 좌표로 잰다.
+            # 보정 후 좌표로 재면 그 값이 다음 프레임의 정규화 분모가 되어
+            # (팔 길이 ↑ → 보정량 ↑ → 팔 길이 ↑↑) 되먹임으로 발산한다.
+            # 캘리브 후에는 CAL_ARM_LEN 상수를 쓰므로 문제가 드러나지 않지만,
+            # 캘리브 전에는 실시간 중앙값을 쓰기 때문에 그대로 터진다.
+            el_m = el_raw if el_raw is not None else el_p
+            wr_m = wr_raw if wr_raw is not None else wr_p
+            ua = math.sqrt((el_m[0] - sh_p[0]) ** 2 + (el_m[1] - sh_p[1]) ** 2 + (el_m[2] - sh_p[2]) ** 2)
+            fa = math.sqrt((wr_m[0] - el_m[0]) ** 2 + (wr_m[1] - el_m[1]) ** 2 + (wr_m[2] - el_m[2]) ** 2)
 
             if (lm[el_idx].visibility > self.VIS_THRESHOLD and
                     ua >= self.MIN_UPPERARM_LEN_M and fa >= self.MIN_FOREARM_LEN_J3_M):
                 # 팔 길이는 프레임마다 흔들리므로 중앙값으로 안정화.
                 # (분모라서 한 프레임만 튀어도 목표점 전체가 크게 흔들림)
-                self.arm_len_buf.append(ua + fa)
-                raw_arm_len = sorted(self.arm_len_buf)[len(self.arm_len_buf) // 2]
+                # 사람 팔 길이 범위(25~75cm) 밖이면 버려서 발산을 막는다.
+                if self.ARM_LEN_SANE_MIN <= (ua + fa) <= self.ARM_LEN_SANE_MAX:
+                    self.arm_len_buf.append(ua + fa)
+                elif not getattr(self, '_arm_len_warned', False):
+                    self._arm_len_warned = True
+                    self.get_logger().warn(
+                        f"[팔길이] 비정상 값 {ua + fa:.3f}m 무시 "
+                        f"(정상 {self.ARM_LEN_SANE_MIN}~{self.ARM_LEN_SANE_MAX}m)")
+                if not self.arm_len_buf:
+                    raw_arm_len = None
+                else:
+                    raw_arm_len = sorted(self.arm_len_buf)[len(self.arm_len_buf) // 2]
                 # 캘리브레이션에서 측정한 고정값이 있으면 그것을 쓴다.
                 # 없을 때만(캘리브 전) 실시간 중앙값으로 대체한다.
                 if self.CAL_ARM_LEN >= self.MIN_ARM_LEN_M:
                     arm_len = self.CAL_ARM_LEN
                 else:
-                    arm_len = sorted(self.arm_len_buf)[len(self.arm_len_buf) // 2]
+                    # raw_arm_len 은 버퍼가 비면 None 이다. 0으로 두면
+                    # 아래 MIN_ARM_LEN_M 검사에서 자연히 걸러진다.
+                    arm_len = raw_arm_len if raw_arm_len else 0.0
 
                 if arm_len >= self.MIN_ARM_LEN_M:
                     vx = (wr_p[0] - sh_p[0]) / arm_len
@@ -2779,44 +3259,159 @@ class MirobotAiNode(Node):
                                 self.WRIST_ANGLE_FRONT,   self.WRIST_ANGLE_STRAIGHT,
                                 self.TOOL_PITCH_FRONT,    self.TOOL_PITCH_STRAIGHT)
 
-                # ── J6 (툴 롤): 손등 너클 라인 기준. 기본 비활성 ──────────────
+                # ── J6 (툴 롤): 전완 축 기준 3D 롤 ────────────────────────────
+                # 화면 각도가 아니라 전완을 축으로 한 회전이므로, 팔을 어디로
+                # 뻗든 '손목 비틀기'에만 반응한다. 언랩은 필터 직전에 한다.
                 if self.ENABLE_J6:
-                    k_dx = hlm[17].x - hlm[5].x     # 검지 MCP → 새끼 MCP
-                    k_dy = hlm[17].y - hlm[5].y
-                    k_mag = math.sqrt(k_dx ** 2 + k_dy ** 2)
-                    # 손이 카메라 정면을 향하면 이 벡터가 짧아지면서 각도가
-                    # 불안정해짐(J5에서 겪은 foreshortening과 같은 패턴)
-                    # → 임계 이하이면 계산하지 않고 직전 값을 유지함.
-                    if k_mag >= self.MIN_KNUCKLE_VEC:
-                        roll = math.degrees(math.atan2(k_dy, k_dx)) * self.J6_SIGN
-                        raw_j6 = max(-self.J6_MAX_DEG, min(self.J6_MAX_DEG, roll))
+                    roll_abs = self._j6_forearm_roll(world_lm, hand_world_lm, active_arm)
+                    if roll_abs is not None:
+                        # 캘리브레이션 기준각이 없으면 첫 유효 프레임을 기준으로
+                        # 삼는다. 캘리브를 안 돌려도 최소한 슬램은 나지 않게.
+                        if not self.CAL_J6_REF_SET:
+                            self.CAL_J6_REF = roll_abs
+                            self.CAL_J6_REF_SET = True
+                            self.get_logger().info(
+                                f"[J6] 기준 롤 임시 설정 {roll_abs:+.1f}° "
+                                f"(캘리브레이션 중립 단계에서 다시 측정됩니다)")
+                        raw_j6 = self._wrap180(roll_abs - self.CAL_J6_REF) * self.J6_SIGN
 
-                # ── 그리퍼: 엄지끝↔검지끝 핀치 비율 (v1 그대로 유지) ──────────
-                h_wrist   = hlm[0]
-                h_mid_mcp = hlm[9]
-                thumb_tip = hlm[4]
-                index_tip = hlm[8]
-                hand_size   = self._dist2d(h_wrist, h_mid_mcp) + 1e-6
-                pinch_ratio = self._dist2d(thumb_tip, index_tip) / hand_size
+                        # 튜닝용 실측 범위
+                        self.j6_dbg_min = min(self.j6_dbg_min, raw_j6)
+                        self.j6_dbg_max = max(self.j6_dbg_max, raw_j6)
 
-                proposed_gripper = self._lerp_clamp(
-                    pinch_ratio,
-                    self.PINCH_CLOSE_RATIO, self.PINCH_OPEN_RATIO,
-                    58.0, 35.0
-                )
+                    # 중립 단계 샘플 수집 (기준각 확정용).
+                    # 조건은 팔 길이 수집과 동일하게 맞춘다 — 준비 시간(3초)이
+                    # 지난 뒤에만 모아야 자세를 잡는 과도기가 안 섞인다.
+                    if (roll_abs is not None and self.calib_mode == 'neutral'
+                            and current_time >= self.calib_prep_until):
+                        self.calib_samples_j6.append(roll_abs)
+
+                # ── 그리퍼: 엄지끝↔검지끝 3D 절대거리 → 2단 상태 ──────────────
+                # v1의 2D 비율(d2(4,8)/d2(0,9))은 분모가 0 에 가까워지며 폭발했다.
+                # 절대 거리는 분모가 없어 그 실패 모드가 원리적으로 없다.
+                pinch_m = None
+                if hand_world_lm is not None:
+                    try:
+                        t3, i3 = hand_world_lm[4], hand_world_lm[8]
+                        pinch_m = math.sqrt((t3.x - i3.x) ** 2 +
+                                            (t3.y - i3.y) ** 2 +
+                                            (t3.z - i3.z) ** 2)
+                    except (IndexError, TypeError):
+                        pinch_m = None
+
+                if pinch_m is None:
+                    # ── 동결 ───────────────────────────────────────────────
+                    # world 랜드마크가 없는 프레임. 판정 근거가 없으므로 후보
+                    # 카운트만 비우고 확정 상태는 그대로 붙잡는다.
+                    # (여기서 열림으로 되돌리면 잡고 있던 물건을 떨군다)
+                    self.gripper_cand = None
+                    self.gripper_cand_cnt = 0
+                else:
+                    self.pinch_last_valid_time = current_time
+
+                    # 임계값 튜닝용 실측 범위 기록
+                    self.pinch_dbg_min = min(self.pinch_dbg_min, pinch_m)
+                    self.pinch_dbg_max = max(self.pinch_dbg_max, pinch_m)
+
+                    if self.GRIPPER_BINARY:
+                        # 1) 히스테리시스 — 중간 구간은 어느 쪽 후보도 아님
+                        if pinch_m <= self.PINCH_CLOSE_ENTER_M:
+                            cand = True          # 닫힘
+                        elif pinch_m >= self.PINCH_OPEN_ENTER_M:
+                            cand = False         # 열림
+                        else:
+                            cand = None          # 중간 → 현재 상태 유지
+
+                        # 2) 확정 프레임 — 연속으로 같은 후보여야 뒤집힘
+                        if cand is None or cand == self.gripper_closed:
+                            self.gripper_cand = None
+                            self.gripper_cand_cnt = 0
+                        else:
+                            if cand == self.gripper_cand:
+                                self.gripper_cand_cnt += 1
+                            else:
+                                self.gripper_cand = cand
+                                self.gripper_cand_cnt = 1
+                            if self.gripper_cand_cnt >= self.GRIPPER_CONFIRM_FRAMES:
+                                self.gripper_closed = cand
+                                self.gripper_cand = None
+                                self.gripper_cand_cnt = 0
+
+                        if self.gripper_closed is not None:
+                            proposed_gripper = (self.GRIPPER_CLOSED_S
+                                                if self.gripper_closed
+                                                else self.GRIPPER_OPEN_S)
+                    else:
+                        # 폴백: v1 2D 연속 보간. 여기서만 2D 비율을 다시 구한다
+                        # (v2 경로는 2D 를 아예 쓰지 않는다).
+                        _hs = self._dist2d(hlm[0], hlm[9])
+                        if _hs > 1e-6:
+                            proposed_gripper = self._lerp_clamp(
+                                self._dist2d(hlm[4], hlm[8]) / _hs,
+                                self.PINCH_CLOSE_RATIO, self.PINCH_OPEN_RATIO,
+                                self.GRIPPER_CLOSED_S, self.GRIPPER_OPEN_S
+                            )
 
                 self._draw_hand_overlay(frame, matched_hand)
 
         # 선택 손이 이번 프레임에 매칭되지 않았어도 토글 상태 머신은 계속 진행
         if matched_hand is None:
             self._update_ai_toggle_gesture(None, current_time)
+            # 손을 아예 못 잡은 프레임도 '가림'과 같이 취급 — 후보만 비우고
+            # 확정된 그리퍼 상태는 유지한다.
+            self.gripper_cand = None
+            self.gripper_cand_cnt = 0
+
+        # ── [진단] 핀치 거리 실측 범위 ────────────────────────────────────
+        # PINCH_CLOSE_ENTER_M / PINCH_OPEN_ENTER_M 를 실측으로 잡기 위한 로그.
+        # 손을 완전히 오므린 채 몇 초, 완전히 편 채 몇 초 유지하면서
+        # 각 구간의 최소/최대를 읽으면 된다.
+        if self.GRU_DEBUG_LOG and self.PINCH_DBG_PERIOD_SEC > 0:
+            if current_time - self.pinch_dbg_t >= self.PINCH_DBG_PERIOD_SEC:
+                if self.pinch_dbg_max >= self.pinch_dbg_min:
+                    state = ('닫힘' if self.gripper_closed
+                             else ('열림' if self.gripper_closed is not None else '미확정'))
+                    self.get_logger().info(
+                        f"[핀치] 최근 {self.PINCH_DBG_PERIOD_SEC:.0f}초 엄지-검지 "
+                        f"{self.pinch_dbg_min*1000:5.1f}~{self.pinch_dbg_max*1000:5.1f}mm  "
+                        f"(닫힘기준 ≤{self.PINCH_CLOSE_ENTER_M*1000:.0f} / "
+                        f"열림기준 ≥{self.PINCH_OPEN_ENTER_M*1000:.0f}mm)  상태={state}")
+                self.pinch_dbg_t = current_time
+                self.pinch_dbg_min = float('inf')
+                self.pinch_dbg_max = float('-inf')
+
+        # ── [진단] J6 롤 실측 범위 ────────────────────────────────────────
+        # J6_SIGN 과 실제 사용 범위를 정하기 위한 로그. 손목을 좌우로 비틀면서
+        # 값이 어느 쪽으로 가는지, 그리퍼가 어느 쪽으로 도는지 같이 보면 된다.
+        # 부호가 반대면 J6_SIGN 을 -1.0 으로 바꾼다.
+        if self.ENABLE_J6 and self.GRU_DEBUG_LOG and self.J6_DEBUG_PERIOD_SEC > 0:
+            if current_time - self.j6_dbg_t >= self.J6_DEBUG_PERIOD_SEC:
+                if self.j6_dbg_max >= self.j6_dbg_min:
+                    self.get_logger().info(
+                        f"[J6] 최근 {self.J6_DEBUG_PERIOD_SEC:.0f}초 롤 "
+                        f"{self.j6_dbg_min:+6.1f}~{self.j6_dbg_max:+6.1f}°  "
+                        f"출력 {self.j6_deg:+6.1f}°  "
+                        f"(기준 {self.CAL_J6_REF:+.1f}° "
+                        f"{'캘리브' if self.calib_j6_from_calib else '임시'}, "
+                        f"한계 ±{self.J6_MAX_DEG:.0f}°, 부호 {self.J6_SIGN:+.0f})")
+                self.j6_dbg_t = current_time
+                self.j6_dbg_min = float('inf')
+                self.j6_dbg_max = float('-inf')
 
         # 손목/툴 축 값 갱신 (안 잡히면 직전 값 유지 — 0으로 되돌리면 급이동함)
         if raw_tool_pitch is not None:
             self.tool_pitch_deg = self.f_j5.filter(
                 self.m_j5.filter(raw_tool_pitch), current_time)
+
         if raw_j6 is not None:
-            self.j6_deg = self.f_j6.filter(self.m_j6.filter(raw_j6), current_time)
+            # 순서가 중요하다: 언랩 → 필터 → 클램프.
+            #   언랩을 먼저 해야 ±180 경계에서 값이 튀지 않는다. 필터를 먼저
+            #   걸면 +175 와 -175 의 평균을 0(정반대 방향)으로 계산한다.
+            #   클램프를 맨 뒤에 둬야 필터가 잘린 값이 아닌 실제 값을 본다.
+            #   (v1 은 클램프 → 필터 순서였고, 그래서 슬램이 필터를 통과했다)
+            j6_unwrapped = self._j6_unwrap(raw_j6)
+            j6_filtered = self.f_j6.filter(self.m_j6.filter(j6_unwrapped), current_time)
+            self.j6_deg = max(-self.J6_MAX_DEG, min(self.J6_MAX_DEG, j6_filtered))
 
         # ══════════════════════════════════════════════════════════════════
         #  STEP 4: 사람 좌표 → 로봇 좌표 → 클램프 → IK → 발행
@@ -2887,10 +3482,27 @@ class MirobotAiNode(Node):
                         f"(중립{self.CAL_UP_NEUTRAL:+.3f} 최대{self.CAL_UP_MAX:+.3f}) "
                         f"→ z {raw_z:5.0f}   "
                         f"lat {norm_lat:+.3f} → J1 {j1_cmd:+.0f}°")
+            # ── 뻗음 적응 계수 ────────────────────────────────────────────
+            # 직전 목표점의 D(J2축~목표점 거리)로 "얼마나 뻗었는지"를 잰다.
+            # 한 프레임 지연이 있지만 D는 프레임 사이에 거의 안 변하므로 무시 가능.
+            # KNEE 아래에서는 0 → 아래 세 값이 모두 기존값 그대로가 된다.
+            ext_excess = 0.0
+            if self.cart_initialized and self.tgt_x is not None:
+                _R = math.hypot(self.tgt_x, self.tgt_y) - self.LINK_A1_MM
+                _Z = self.tgt_z - self.LINK_D1_MM
+                _ratio = math.hypot(_R, _Z) / max(self.WS_D_MAX_MM, 1e-6)
+                _denom = max(1.0 - self.CART_EXT_KNEE, 1e-6)
+                ext_excess = max(0.0, min(1.0, (_ratio - self.CART_EXT_KNEE) / _denom))
+
+            ext_cutoff = self.CART_MIN_CUTOFF * (
+                1.0 - (1.0 - self.CART_EXT_CUTOFF_SCALE) * ext_excess)
+            ext_window = self.CART_MEDIAN_WINDOW + int(round(
+                (self.CART_MEDIAN_WINDOW_MAX - self.CART_MEDIAN_WINDOW) * ext_excess))
+
             # 카테시안 필터 (중앙값 사전필터 → One Euro)
-            fx = self.f_cx.filter(self.m_cx.filter(raw_x), current_time)
-            fy = self.f_cy.filter(self.m_cy.filter(raw_y), current_time)
-            fz = self.f_cz.filter(self.m_cz.filter(raw_z), current_time)
+            fx = self.f_cx.filter(self.m_cx.filter(raw_x, ext_window), current_time, ext_cutoff)
+            fy = self.f_cy.filter(self.m_cy.filter(raw_y, ext_window), current_time, ext_cutoff)
+            fz = self.f_cz.filter(self.m_cz.filter(raw_z, ext_window), current_time, ext_cutoff)
 
             # 직교공간 속도 제한.
             # [주의] v1에서 제거한 관절 변화량 제한(MAX_DELTA_J*)의 부활이 아님.
@@ -2908,7 +3520,34 @@ class MirobotAiNode(Node):
                     fz = self.tgt_z + dz * s
 
             # 작업공간 클램프 (IK 직전)
-            cx, cy, cz, was_clamped = self._clamp_to_workspace(fx, fy, fz)
+            cx, cy, cz, was_clamped, clamp_reason, clamp_mag = \
+                self._clamp_to_workspace(fx, fy, fz)
+
+            # ── EDGE 판정: 허용오차 + 히스테리시스 ────────────────────────
+            # 경계를 스치기만 한 경우(1mm 미만)까지 EDGE 로 띄우면 배지가
+            # 깜빡여서 "정말 벗어난 것"과 구분이 안 된다.
+            if clamp_mag >= self.WS_EDGE_ON_MM:
+                self.ws_edge_active = True
+                self.ws_clamp_reason = clamp_reason
+                self.ws_clamp_mag = clamp_mag
+            elif clamp_mag <= self.WS_EDGE_OFF_MM:
+                self.ws_edge_active = False
+                self.ws_clamp_reason = ''
+                self.ws_clamp_mag = 0.0
+
+            # ── [진단] 어떤 제약이 얼마나 잘랐는지 ────────────────────────
+            # 어떤 상수를 손봐야 하는지 바로 알 수 있게 클램프 전/후를 같이 찍는다.
+            if self.ws_edge_active and self.WS_EDGE_LOG_PERIOD_SEC > 0:
+                if current_time - self.ws_edge_log_t >= self.WS_EDGE_LOG_PERIOD_SEC:
+                    self.ws_edge_log_t = current_time
+                    _R = math.hypot(fx, fy) - self.LINK_A1_MM
+                    _D = math.hypot(_R, fz - self.LINK_D1_MM)
+                    self.get_logger().info(
+                        f"[작업공간] {clamp_reason} 로 {clamp_mag:.0f}mm 밀림  "
+                        f"요청=({fx:.0f}, {fy:.0f}, {fz:.0f}) D={_D:.0f} "
+                        f"→ 적용=({cx:.0f}, {cy:.0f}, {cz:.0f})  "
+                        f"[한계 D={self.WS_D_MIN_MM:.0f}~{self.WS_D_MAX_MM:.0f} "
+                        f"z={self.WS_Z_MIN_MM:.0f}~{self.WS_Z_MAX_MM:.0f}]")
 
             self.tgt_x, self.tgt_y, self.tgt_z = cx, cy, cz
             self.last_cart_time = current_time
@@ -2921,11 +3560,14 @@ class MirobotAiNode(Node):
             j6 = self.j6_deg if self.ENABLE_J6 else 0.0
 
             self.last_ik = (j1, j2, j3)
-            self.last_ik_ok = ik_ok and not was_clamped
+            self.last_ik_ok = ik_ok and not self.ws_edge_active
             if not ik_ok:
                 self.ik_status_text = 'JOINT LIMIT'
-            elif was_clamped:
-                self.ik_status_text = 'WORKSPACE EDGE'
+            elif self.ws_edge_active:
+                # 어느 제약이 얼마나 잘랐는지까지 표시 (예: "EDGE D_MAX 12mm")
+                self.ik_status_text = (
+                    f'EDGE {self.ws_clamp_reason} {self.ws_clamp_mag:.0f}mm'
+                    if self.ws_clamp_reason else 'WORKSPACE EDGE')
             elif j5_sat:
                 self.ik_status_text = 'WRIST LIMIT'
             else:
@@ -2961,11 +3603,19 @@ class MirobotAiNode(Node):
                     # 특이점 근처에서는 손끝 1mm 이동이 관절 20° 변화가 될 수
                     # 있어서, 관절 기준 데드밴드로는 미세 떨림과 큰 변화를
                     # 구분할 수 없기 때문.
+                    #
+                    # [뻗음 적응] 멀리 뻗을수록 (a) 입력 노이즈가 mm 단위로
+                    # 커지고 (b) 같은 mm 오차가 더 큰 관절 변화가 되므로,
+                    # 고정 데드밴드로는 손을 멈춰도 매 프레임 문턱을 넘어
+                    # 헛명령이 계속 나간다. 뻗은 구간에서만 문턱을 넓힌다.
+                    deadband_eff = self.DEADBAND_CART_MM * (
+                        1.0 + (self.CART_EXT_DEADBAND_SCALE - 1.0) * ext_excess)
+
                     moved = True
                     if self.last_published_cart is not None:
                         px, py, pz = self.last_published_cart
                         moved = (math.sqrt((cx - px) ** 2 + (cy - py) ** 2 + (cz - pz) ** 2)
-                                 >= self.DEADBAND_CART_MM)
+                                 >= deadband_eff)
 
                     j5_changed = abs(j5 - self.last_published_joints[4]) >= self.DEADBAND_J5
                     j6_changed = (self.ENABLE_J6 and

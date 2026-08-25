@@ -6,6 +6,11 @@ setup(
     name=package_name,
     version='0.0.0',
     packages=find_packages(exclude=['test']),
+    # .npz(GRU 가중치)는 파이썬 파일이 아니어서 자동 복사되지 않는다.
+    # 이 설정이 없으면 빌드 후 install 경로에 모델이 없어
+    # 보정이 조용히 비활성화된다.
+    package_data={package_name: ['*.npz']},
+    include_package_data=True,
     data_files=[
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),

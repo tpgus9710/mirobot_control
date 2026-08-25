@@ -63,6 +63,16 @@ class MirobotDriverNode(Node):
         self.busy_since = 0.0      # busy로 전환된 시각 (타임아웃 안전장치용)
         self._expected_ok_count = 0  # busy 진입 시점의 ok_seen_count 기준값
 
+        # [측정] 'ok' 응답 지연 계측용. 제어 경로에서는 읽지 않는다 —
+        # 순수하게 진단 목적이라 값이 낡아도 동작에 영향이 없다.
+        self._ok_lat = []
+        self._ok_mv = []
+        self._ok_csv = None
+        self._ok_t0 = time.time()
+        self._ok_last_summary = 0.0
+        self._last_sent_joints = None
+        self._pending_move_deg = 0.0
+
         # 상시 시리얼 리더 스레드가 채워주는 공유 상태
         self.robot_status = 'Unknown'  # 마지막으로 파싱된 상태 토큰 (호밍 재확인용으로만 사용)
         self.idle_streak = 0           # 연속으로 확인된 Idle 상태 횟수 (호밍용)
@@ -285,6 +295,80 @@ class MirobotDriverNode(Node):
     # 시리얼 상에 명령이 하나도 떠 있지 않을 때(busy==False)만 대기 중인 값을
     # 하나 골라 전송함. 팔 목표값을 그리퍼보다 우선 처리 — 그리퍼는 짧고 자주
     # 안 바뀌는 반면 팔은 연속적인 움직임이 더 중요하기 때문.
+    # ══════════════════════════════════════════════════════════════════════
+    #  [측정] 'ok' 응답 지연 계측
+    #
+    #  목적: 'ok'가 "명령을 파싱했다"인지 "동작이 끝났다"인지 판별한다.
+    #  이 노드의 busy 가드는 후자를 전제로 만들어졌는데, 전자라면 가드가
+    #  사실상 없는 것과 같고 명령이 펌웨어 버퍼에 쌓인다.
+    #
+    #  CSV 로도 남긴다 — 터미널에서 눈으로 세는 것보다 정확하고, 나중에
+    #  다시 볼 수 있다. 측정이 끝나면 ENABLE_OK_LATENCY_LOG 를 False 로.
+    # ══════════════════════════════════════════════════════════════════════
+    ENABLE_OK_LATENCY_LOG = True
+    OK_LATENCY_CSV = '/tmp/ok_latency.csv'
+    OK_LATENCY_SUMMARY_SEC = 5.0     # 이 주기로 요약을 한 줄 찍는다
+
+    def _log_ok_latency(self, ms):
+        if not self.ENABLE_OK_LATENCY_LOG:
+            return
+        mv = getattr(self, '_pending_move_deg', 0.0)
+        self._ok_lat.append(ms)
+        self._ok_mv.append(mv)
+
+        if self._ok_csv is None:
+            try:
+                self._ok_csv = open(self.OK_LATENCY_CSV, 'w')
+                self._ok_csv.write('idx,latency_ms,move_deg\n')
+            except Exception as e:
+                self.get_logger().warn(f"[ok측정] CSV 열기 실패: {e}")
+                self._ok_csv = False
+        if self._ok_csv:
+            try:
+                self._ok_csv.write(f"{len(self._ok_lat)},{ms:.2f},{mv:.3f}\n")
+                self._ok_csv.flush()
+            except Exception:
+                pass
+
+        now = time.time()
+        if now - self._ok_last_summary < self.OK_LATENCY_SUMMARY_SEC:
+            return
+        self._ok_last_summary = now
+        if len(self._ok_lat) < 5:
+            return
+
+        lat = sorted(self._ok_lat[-200:])
+        mv_recent = self._ok_mv[-200:]
+        lat_recent = self._ok_lat[-200:]
+        n = len(lat)
+        med = lat[n // 2]
+        p10, p90 = lat[int(n * 0.1)], lat[int(n * 0.9)]
+
+        # 지연과 이동거리의 상관 — 완료 응답이라면 양의 상관이 나와야 한다
+        corr = float('nan')
+        if n >= 10:
+            mx = sum(mv_recent) / n
+            my = sum(lat_recent) / n
+            num = sum((mv_recent[i] - mx) * (lat_recent[i] - my) for i in range(n))
+            dx = sum((v - mx) ** 2 for v in mv_recent)
+            dy = sum((v - my) ** 2 for v in lat_recent)
+            if dx > 1e-9 and dy > 1e-9:
+                corr = num / (dx ** 0.5 * dy ** 0.5)
+
+        # 판정
+        if med < 15.0:
+            verdict = "★ 파싱 응답 — 명령이 펌웨어 버퍼에 쌓이는 중"
+        elif med > 60.0 and (corr != corr or corr > 0.3):
+            verdict = "동작 완료 응답 — busy 가드가 설계대로 작동 중"
+        else:
+            verdict = "판정 애매 — 아래 수치를 그대로 공유할 것"
+
+        rate = len(self._ok_lat) / max(now - self._ok_t0, 1e-6)
+        self.get_logger().info(
+            f"[ok측정] 지연 중앙 {med:.1f}ms (10~90%: {p10:.1f}~{p90:.1f}) "
+            f"이동거리 상관 {corr:+.2f}  전송률 {rate:.1f}회/초  "
+            f"표본 {len(self._ok_lat)}  →  {verdict}")
+
     def _try_send_pending(self):
         if self.is_homing:
             return
@@ -295,6 +379,19 @@ class MirobotDriverNode(Node):
 
         if self.busy:
             if self.ok_seen_count > self._expected_ok_count:
+                # ── [측정] 'ok' 응답 지연 ─────────────────────────────────
+                # 이 노드는 "WLKATA 펌웨어가 동작을 끝낸 뒤에 'ok'를 준다"고
+                # 가정하고 설계됐지만, 그 가정은 검증된 적이 없다.
+                # 표준 GRBL은 명령을 '파싱'했을 때 바로 'ok'를 돌려준다.
+                #
+                #   1~5ms 로 일정      → 파싱 응답. busy 가드가 무력화되고
+                #                        명령이 펌웨어 플래너 버퍼에 쌓인다.
+                #                        (손을 멈춰도 로봇이 옛 명령을 재생)
+                #   80~250ms, 변동     → 동작 완료 응답. 설계대로 동작 중.
+                #
+                # 이동 거리도 같이 남긴다. 완료 응답이라면 거리가 클수록
+                # 지연도 길어야 한다 — 상관이 없으면 파싱 응답이라는 뜻.
+                self._log_ok_latency((now - self.busy_since) * 1000.0)
                 self.busy = False
             elif now - self.busy_since > self.BUSY_TIMEOUT:
                 # 안전장치: 'ok'를 못 받았어도 너무 오래 막혀있지 않도록 강제 해제
@@ -307,7 +404,15 @@ class MirobotDriverNode(Node):
         if self.pending_joint_target is not None:
             target = self.pending_joint_target
             self.pending_joint_target = None
-            gcode = f"G0 X{target[0]:.2f} Y{target[1]:.2f} Z{target[2]:.2f} A{target[3]:.2f} B{target[4]:.2f} C{target[5]:.2f} F2000\r\n"
+            # 이번 명령의 이동량(직전 전송값 대비 관절 변화 합). 'ok' 지연이
+            # 동작 완료를 뜻한다면 이 값과 지연이 비례해야 한다.
+            if self._last_sent_joints is not None:
+                self._pending_move_deg = sum(
+                    abs(target[i] - self._last_sent_joints[i]) for i in range(6))
+            else:
+                self._pending_move_deg = 0.0
+            self._last_sent_joints = list(target)
+            gcode = f"G0 X{target[0]:.2f} Y{target[1]:.2f} Z{target[2]:.2f} A{target[3]:.2f} B{target[4]:.2f} C{target[5]:.2f} F600\r\n"
             self._dispatch(gcode, f"Sent Joint G-Code: {gcode.strip()}")
 
         elif self.pending_gripper_target is not None:

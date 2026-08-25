@@ -7,3 +7,10 @@ __pycache__/
 *.egg-info/
 *.npz
 src/mirobot_ai_control/mirobot_ai_control/node_backup/
+
+# 백업 파일 (작업 중 생성, 저장소에 불필요)
+*.bak
+*.bak_*
+
+# GRU 모델은 예외 — 63KB, 배포에 필수
+!src/mirobot_ai_control/mirobot_ai_control/*.npz

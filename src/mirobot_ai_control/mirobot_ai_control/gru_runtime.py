@@ -14,10 +14,19 @@ PyTorch 없이 numpy만으로 GRU를 한 프레임씩 실행한다.
 좌표 규약 (학습과 동일해야 함):
     · 어깨를 원점으로 하는 상대 벡터
     · 팔 길이(어깨→팔꿈치→손목 합)로 나눠 정규화
-    · 입력 = [팔꿈치(3), 손목(3)] (+ vel 이면 각각의 1차 차분 6개 = 12차원)
+    · 입력 = [팔꿈치(3), 손목(3)] (+ vel 이면 1차 차분 6개) (+ feats 보조 특징)
+      순서: 좌표 → 속도 → 보조 특징. 이 순서는 train_gru 와 일치해야 한다.
     · 출력 = 잔차. 최종 = 입력 + 잔차
 """
 import numpy as np
+
+# 학습·추론이 공유하는 특징 계산.
+# ROS 패키지로 설치되면 패키지 경로로, ~/nlf_work 에서 단독 실행할 때는
+# 같은 폴더에서 찾는다. 두 환경에서 같은 파일을 쓰므로 양쪽을 다 받는다.
+try:
+    from mirobot_ai_control import gru_features as GF
+except ImportError:
+    import gru_features as GF
 
 
 def _sigmoid(x):
@@ -41,6 +50,17 @@ class GRURuntime:
         self.with_elbow = bool(z["with_elbow"])
         self.use_vel = bool(z["vel"])
         self.arm_len_train = float(z["arm_len_train"])
+        # 학습 시 사용한 보조 특징 세트. 옛 npz에는 이 키가 없으므로
+        # 기본값 'off'(=v7 이전과 동일)로 둔다.
+        self.feats = str(z["feats"]) if "feats" in z.files else "off"
+
+        base = (6 if self.with_elbow else 3) * (2 if self.use_vel else 1)
+        want = base + GF.n_extra(self.feats)
+        if want != self.in_dim:
+            raise ValueError(
+                f"입력 차원 불일치: npz in_dim={self.in_dim} 인데 "
+                f"with_elbow/vel/feats={self.feats} 조합은 {want} 를 뜻한다. "
+                f"학습·배포 버전이 어긋났을 가능성이 크다.")
 
         H = self.H
         # PyTorch nn.GRU 게이트 순서: (reset, update, new)
@@ -132,6 +152,10 @@ class LandmarkCorrector:
             x = np.concatenate([feat, vel])
         else:
             x = feat
+
+        # 보조 특징은 속도 뒤에 붙인다. train_gru 와 순서가 같아야 한다.
+        if self.rt.feats != "off":
+            x = GF.append_feats(x, self.rt.feats, self.rt.with_elbow)
 
         res = self.rt.step(x)          # 잔차 예측
 
