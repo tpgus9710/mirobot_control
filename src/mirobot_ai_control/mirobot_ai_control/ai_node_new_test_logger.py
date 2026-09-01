@@ -520,6 +520,19 @@ class MirobotAiNode(Node):
         self.REMOTE_FRAME_TIMEOUT = 2.0
         self.source_aspect = None
 
+        # ── [DEBUG] NLF 검증용 원본 프레임 녹화 ──────────────────────────────
+        # 환경변수 NLF_RECORD_DIR가 설정돼 있으면, process_frame()이 실제로
+        # MediaPipe에 넣는 것과 동일한(리사이즈 후) 프레임을 그 디렉토리에
+        # 순번+타임스탬프로 저장한다. 나중에 이 파일들에 MediaPipe와 NLF를
+        # 각각 오프라인으로 돌려서 같은 입력으로 비교하기 위함.
+        # 검증 끝나면 이 블록과 process_frame()의 저장 코드는 삭제할 것.
+        self._nlf_record_dir = os.environ.get('NLF_RECORD_DIR', '').strip()
+        self._nlf_record_idx = 0
+        if self._nlf_record_dir:
+            os.makedirs(self._nlf_record_dir, exist_ok=True)
+            self.get_logger().info(
+                f"[DBG-NLF-RECORD] 프레임 녹화 활성화 → {self._nlf_record_dir}")
+
         self._start_mjpeg_server()
         self._start_upload_ws_server()
 
@@ -1738,6 +1751,12 @@ class MirobotAiNode(Node):
         if frame.shape[1] != 480 or frame.shape[0] != 480:
             frame = cv2.resize(frame, (480, 480))
 
+        # [DEBUG] NLF 검증용 프레임 저장 (NLF_RECORD_DIR 설정 시에만 동작)
+        if self._nlf_record_dir:
+            self._nlf_record_idx += 1
+            fname = f"{self._nlf_record_idx:06d}_{time.time():.3f}.jpg"
+            cv2.imwrite(os.path.join(self._nlf_record_dir, fname), frame)
+
         # 좌우 반전(거울 모드): 이 때문에 MediaPipe 핸드니스가 실제와 반대
         frame     = cv2.flip(frame, 1)
         h, w, _   = frame.shape
@@ -1804,8 +1823,27 @@ class MirobotAiNode(Node):
             el_w = world_lm[el_idx]
             wr_w = world_lm[wr_idx]
 
+            # ── 손목 신뢰도 급락(occlusion 진입) 가드 ──────────────────────────
+            # 전완 길이 가드는 "confidence는 높은데 위치만 틀린" 경우를 잡지만,
+            # 실제 occlusion 진입 구간(986005369초 로그처럼 vis가 0.96→0.69로
+            # 계속 떨어지며 팔꿈치·손목이 같이 흔들리는 경우)은 절대 방문턱값
+            # (VIS_THRESHOLD=0.5)까지는 안 내려가서 안 걸러졌다. 손목 신뢰도가
+            # 이 구간에서 관찰된 것보다 더 엄격한 기준 밑으로 떨어지면, 손목
+            # 위치를 이번 프레임엔 신뢰하지 않고 직전에 신뢰했던 위치를 그대로
+            # 재사용한다(팔꿈치 가드와 동일한 hold 전략).
+            WRIST_VIS_MIN = 0.80
+
+            prev_good_wr_w = getattr(self, '_prev_good_wr_w', None)
+            wrist_vis = lm[wr_idx].visibility
+
+            if wrist_vis < WRIST_VIS_MIN and prev_good_wr_w is not None:
+                wr_x, wr_y, wr_z = prev_good_wr_w
+            else:
+                wr_x, wr_y, wr_z = wr_w.x, wr_w.y, wr_w.z
+                self._prev_good_wr_w = (wr_x, wr_y, wr_z)
+
             ua = math.sqrt((el_w.x - sh_w.x) ** 2 + (el_w.y - sh_w.y) ** 2 + (el_w.z - sh_w.z) ** 2)
-            fa = math.sqrt((wr_w.x - el_w.x) ** 2 + (wr_w.y - el_w.y) ** 2 + (wr_w.z - el_w.z) ** 2)
+            fa = math.sqrt((wr_x - el_w.x) ** 2 + (wr_y - el_w.y) ** 2 + (wr_z - el_w.z) ** 2)
 
             # [DEBUG] 팔꿈치 world 랜드마크가 프레임 간 얼마나 튀는지 확인용.
             # 원인 진단 끝나면 이 블록은 삭제할 것.
@@ -1821,6 +1859,29 @@ class MirobotAiNode(Node):
                         f"vis={lm[el_idx].visibility:.2f}  ua={ua*1000:.1f}mm  fa={fa*1000:.1f}mm")
             self._dbg_prev_el_w = (el_w.x, el_w.y, el_w.z)
 
+            # ── 전완 길이 급변 가드 ──────────────────────────────────────────
+            # 사람 전완(팔꿈치~손목) 길이는 물리적으로 프레임마다 거의 안 변하는데,
+            # MediaPipe가 confidence(visibility)는 높게 주면서 위치는 틀리는 경우
+            # (주로 깊이 방향으로 팔을 뻗을 때의 전경축소 구간)엔 fa가 프레임 한 장
+            # 사이에 수십mm씩 튄다. VIS_THRESHOLD/MIN_*_LEN 가드로는 못 걸러지므로,
+            # fa 변화량 자체를 검사해서 급변 프레임의 팔꿈치는 버리고 직전에 받아들인
+            # 팔꿈치 값을 재사용한다.
+            FOREARM_JUMP_THRESHOLD_M = 0.025  # 25mm/frame
+
+            prev_good_el_w = getattr(self, '_prev_good_el_w', None)
+            prev_good_fa = getattr(self, '_prev_good_fa', None)
+
+            if (prev_good_el_w is not None and prev_good_fa is not None and
+                    abs(fa - prev_good_fa) > FOREARM_JUMP_THRESHOLD_M):
+                # 이번 프레임 팔꿈치는 신뢰하지 않고 직전 값으로 대체
+                el_x, el_y, el_z = prev_good_el_w
+                ua = math.sqrt((el_x - sh_w.x) ** 2 + (el_y - sh_w.y) ** 2 + (el_z - sh_w.z) ** 2)
+                fa = math.sqrt((wr_x - el_x) ** 2 + (wr_y - el_y) ** 2 + (wr_z - el_z) ** 2)
+            else:
+                # 정상 범위 → 이번 프레임을 새 기준으로 채택
+                self._prev_good_el_w = (el_w.x, el_w.y, el_w.z)
+                self._prev_good_fa = fa
+
             if (lm[el_idx].visibility > self.VIS_THRESHOLD and
                     ua >= self.MIN_UPPERARM_LEN_M and fa >= self.MIN_FOREARM_LEN_J3_M):
                 # 팔 길이는 프레임마다 흔들리므로 중앙값으로 안정화.
@@ -1829,9 +1890,9 @@ class MirobotAiNode(Node):
                 arm_len = sorted(self.arm_len_buf)[len(self.arm_len_buf) // 2]
 
                 if arm_len >= self.MIN_ARM_LEN_M:
-                    vx = (wr_w.x - sh_w.x) / arm_len
-                    vy = (wr_w.y - sh_w.y) / arm_len
-                    vz = (wr_w.z - sh_w.z) / arm_len
+                    vx = (wr_x - sh_w.x) / arm_len
+                    vy = (wr_y - sh_w.y) / arm_len
+                    vz = (wr_z - sh_w.z) / arm_len
 
                     # MediaPipe world 좌표계: y는 아래로 +, z는 카메라에서 멀수록 +
                     #  → 팔을 카메라 쪽으로 뻗으면 z가 감소하므로 -vz가 "앞으로"
@@ -2024,6 +2085,18 @@ class MirobotAiNode(Node):
                 max_step = self.MAX_CART_SPEED_MM_S * dt
                 dx, dy, dz = fx - self.tgt_x, fy - self.tgt_y, fz - self.tgt_z
                 dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+
+                # [DEBUG] 속도제한(clamp) 걸리기 "전"의 원시 목표점 이동량.
+                # 실물 로봇이 없어도, 여기 찍히는 dist가 곧 "로봇이 실제로
+                # 얼마나 튀려고 했는지"에 해당함. 팔꿈치 가드 패치 전/후 비교용.
+                # 원인 진단 끝나면 이 블록은 삭제할 것.
+                if dist > 30.0:  # 30mm/frame 이상만 로그 (필터/속도제한 걸리기 전 값)
+                    self.get_logger().info(
+                        f"[DBG-TARGET-JUMP] raw_dist={dist:.1f}mm  "
+                        f"(capped_to={min(dist, max_step):.1f}mm)  "
+                        f"raw_target=({fx:.0f},{fy:.0f},{fz:.0f})  "
+                        f"prev_target=({self.tgt_x:.0f},{self.tgt_y:.0f},{self.tgt_z:.0f})")
+
                 if dist > max_step and dist > 1e-6:
                     s = max_step / dist
                     fx = self.tgt_x + dx * s

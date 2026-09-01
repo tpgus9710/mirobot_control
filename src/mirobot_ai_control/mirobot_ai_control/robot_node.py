@@ -162,6 +162,12 @@ class MirobotDriverNode(Node):
             
         self.get_logger().info("하드웨어 호밍(원점 정렬)을 시작합니다. 완료될 때까지 다른 명령은 무시됩니다...")
         self.is_homing = True
+
+        # [호밍 안전] 호밍 시작 직전에 콜백이 채워둔 목표값을 제거한다.
+        # 콜백의 is_homing 가드는 '검사 후 대입' 사이에 호밍이 시작되는
+        # 경합을 막지 못하므로 여기서 한 번 비운다.
+        self.pending_joint_target = None
+        self.pending_gripper_target = None
         
         status_msg = Bool()
         status_msg.data = True
@@ -197,6 +203,12 @@ class MirobotDriverNode(Node):
             self.ser.write(b"O105\r\n")
         time.sleep(0.5)
             
+        # [호밍 안전] is_homing / busy 를 풀기 "전에" 슬롯을 비운다.
+        # 호밍 중 경합으로 새어 들어온 낡은 목표값이 남아 있으면,
+        # busy 해제 즉시 _try_send_pending 이 그것을 전송해 급이동한다.
+        self.pending_joint_target = None
+        self.pending_gripper_target = None
+
         self.is_homing = False
         # 호밍 직후 로봇은 실제로 정지·대기 상태이므로 busy를 확실히 풀어줌
         self.busy = False
