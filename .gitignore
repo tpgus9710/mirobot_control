@@ -5,3 +5,9 @@ log/
 __pycache__/
 .vscode/
 *.egg-info/
+
+# 작업 중 만든 스냅샷/일회성 스크립트 — 로컬에만 보관
+*.bak
+*.bak[0-9]
+*_OG.py
+patch_*.py
