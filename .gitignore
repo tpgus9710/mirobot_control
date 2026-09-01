@@ -6,8 +6,17 @@ __pycache__/
 .vscode/
 *.egg-info/
 
-# 작업 중 만든 스냅샷/일회성 스크립트 — 로컬에만 보관
+# 학습용 데이터·모델은 용량이 커서 기본 제외.
+# 다만 패키지 안의 GRU 가중치는 런타임에 필요하므로 예외로 둔다.
+# (순서 중요 — 예외는 제외 규칙 뒤에 와야 한다)
+*.npz
+!src/mirobot_ai_control/mirobot_ai_control/*.npz
+
+src/mirobot_ai_control/mirobot_ai_control/node_backup/
+
+# 작업 중 만든 스냅샷·일회성 스크립트 — 로컬에만 보관
 *.bak
+*.bak_*
 *.bak[0-9]
 *_OG.py
 patch_*.py

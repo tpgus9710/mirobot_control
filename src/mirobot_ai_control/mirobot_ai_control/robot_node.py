@@ -63,6 +63,16 @@ class MirobotDriverNode(Node):
         self.busy_since = 0.0      # busy로 전환된 시각 (타임아웃 안전장치용)
         self._expected_ok_count = 0  # busy 진입 시점의 ok_seen_count 기준값
 
+        # [측정] 'ok' 응답 지연 계측용. 제어 경로에서는 읽지 않는다 —
+        # 순수하게 진단 목적이라 값이 낡아도 동작에 영향이 없다.
+        self._ok_lat = []
+        self._ok_mv = []
+        self._ok_csv = None
+        self._ok_t0 = time.time()
+        self._ok_last_summary = 0.0
+        self._last_sent_joints = None
+        self._pending_move_deg = 0.0
+
         # 상시 시리얼 리더 스레드가 채워주는 공유 상태
         self.robot_status = 'Unknown'  # 마지막으로 파싱된 상태 토큰 (호밍 재확인용으로만 사용)
         self.idle_streak = 0           # 연속으로 확인된 Idle 상태 횟수 (호밍용)
@@ -153,6 +163,12 @@ class MirobotDriverNode(Node):
     # 로봇 부팅 시 비동기 스레드로 홈 복귀 시퀀스 가동 (실행 병목 제거)
     def init_robot(self):
         if self.ser and self.ser.is_open:
+            # 스레드가 실제로 뜨기 전의 짧은 틈에도 joint_callback이 새 목표값을
+            # 큐에 쌓을 수 있으므로, 스레드 기동 전에 is_homing을 먼저 걸고
+            # 혹시 이미 쌓여있던 목표값(대기 큐)도 여기서 미리 비워둠.
+            self.is_homing = True
+            self.pending_joint_target = None
+            self.pending_gripper_target = None
             threading.Thread(target=self.run_homing_sequence, daemon=True).start()
 
     # 홈 복귀 완수를 모니터링하는 코어 가동 루프 수행.
@@ -161,11 +177,12 @@ class MirobotDriverNode(Node):
             return
             
         self.get_logger().info("하드웨어 호밍(원점 정렬)을 시작합니다. 완료될 때까지 다른 명령은 무시됩니다...")
+        # 호출부(raw_callback/init_robot)에서 이미 걸어뒀겠지만, 이 함수가 다른 경로로
+        # 호출될 가능성까지 대비해 여기서도 한 번 더 확실히 걸고 큐를 비움(idempotent).
         self.is_homing = True
 
-        # [호밍 안전] 호밍 시작 직전에 콜백이 채워둔 목표값을 제거한다.
-        # 콜백의 is_homing 가드는 '검사 후 대입' 사이에 호밍이 시작되는
-        # 경합을 막지 못하므로 여기서 한 번 비운다.
+        # 콜백의 is_homing 가드만으로는 '검사 후 대입' 사이에 호밍이
+        # 시작되는 경합을 막지 못한다. 그래서 여기서 한 번 비운다.
         self.pending_joint_target = None
         self.pending_gripper_target = None
         
@@ -202,13 +219,12 @@ class MirobotDriverNode(Node):
         with self.serial_lock:
             self.ser.write(b"O105\r\n")
         time.sleep(0.5)
-            
-        # [호밍 안전] is_homing / busy 를 풀기 "전에" 슬롯을 비운다.
-        # 호밍 중 경합으로 새어 들어온 낡은 목표값이 남아 있으면,
-        # busy 해제 즉시 _try_send_pending 이 그것을 전송해 급이동한다.
+
+        # 호밍 중 어떤 경로로든 큐에 쌓였을 가능성까지 마지막으로 차단한다.
+        # is_homing / busy 를 푸는 순간 _try_send_pending 이 남아있던 낡은
+        # 목표값을 그대로 전송해 급이동하므로, 푸는 것보다 먼저 비워야 한다.
         self.pending_joint_target = None
         self.pending_gripper_target = None
-
         self.is_homing = False
         # 호밍 직후 로봇은 실제로 정지·대기 상태이므로 busy를 확실히 풀어줌
         self.busy = False
@@ -223,6 +239,16 @@ class MirobotDriverNode(Node):
             cmd = msg.data.strip()
             if cmd == "$H":
                 if not self.is_homing:
+                    # [호밍 전 목표값 잔류 방지] 스레드가 실제로 뜨기 전 짧은 틈에도
+                    # joint_callback이 새 목표값을 큐에 쌓을 수 있고, 무엇보다
+                    # "호밍이 시작되기 직전 이미 큐에 대기 중이던 목표값"이 그대로
+                    # 남아있다가 호밍이 끝나는 순간 그대로 재생되면 방금 원점으로
+                    # 돌아온 로봇이 갑자기 그 낡은 각도로 급이동하는 사고로 이어짐
+                    # (실제로 발생했던 "호밍 후 이상한 자세로 갈리는" 증상의 원인).
+                    # 그래서 스레드 기동 전에 is_homing부터 걸고 큐를 반드시 비움.
+                    self.is_homing = True
+                    self.pending_joint_target = None
+                    self.pending_gripper_target = None
                     threading.Thread(target=self.run_homing_sequence, daemon=True).start()
             else:
                 if not self.is_homing:
@@ -273,6 +299,80 @@ class MirobotDriverNode(Node):
     # 시리얼 상에 명령이 하나도 떠 있지 않을 때(busy==False)만 대기 중인 값을
     # 하나 골라 전송함. 팔 목표값을 그리퍼보다 우선 처리 — 그리퍼는 짧고 자주
     # 안 바뀌는 반면 팔은 연속적인 움직임이 더 중요하기 때문.
+    # ══════════════════════════════════════════════════════════════════════
+    #  [측정] 'ok' 응답 지연 계측
+    #
+    #  목적: 'ok'가 "명령을 파싱했다"인지 "동작이 끝났다"인지 판별한다.
+    #  이 노드의 busy 가드는 후자를 전제로 만들어졌는데, 전자라면 가드가
+    #  사실상 없는 것과 같고 명령이 펌웨어 버퍼에 쌓인다.
+    #
+    #  CSV 로도 남긴다 — 터미널에서 눈으로 세는 것보다 정확하고, 나중에
+    #  다시 볼 수 있다. 측정이 끝나면 ENABLE_OK_LATENCY_LOG 를 False 로.
+    # ══════════════════════════════════════════════════════════════════════
+    ENABLE_OK_LATENCY_LOG = True
+    OK_LATENCY_CSV = '/tmp/ok_latency.csv'
+    OK_LATENCY_SUMMARY_SEC = 5.0     # 이 주기로 요약을 한 줄 찍는다
+
+    def _log_ok_latency(self, ms):
+        if not self.ENABLE_OK_LATENCY_LOG:
+            return
+        mv = getattr(self, '_pending_move_deg', 0.0)
+        self._ok_lat.append(ms)
+        self._ok_mv.append(mv)
+
+        if self._ok_csv is None:
+            try:
+                self._ok_csv = open(self.OK_LATENCY_CSV, 'w')
+                self._ok_csv.write('idx,latency_ms,move_deg\n')
+            except Exception as e:
+                self.get_logger().warn(f"[ok측정] CSV 열기 실패: {e}")
+                self._ok_csv = False
+        if self._ok_csv:
+            try:
+                self._ok_csv.write(f"{len(self._ok_lat)},{ms:.2f},{mv:.3f}\n")
+                self._ok_csv.flush()
+            except Exception:
+                pass
+
+        now = time.time()
+        if now - self._ok_last_summary < self.OK_LATENCY_SUMMARY_SEC:
+            return
+        self._ok_last_summary = now
+        if len(self._ok_lat) < 5:
+            return
+
+        lat = sorted(self._ok_lat[-200:])
+        mv_recent = self._ok_mv[-200:]
+        lat_recent = self._ok_lat[-200:]
+        n = len(lat)
+        med = lat[n // 2]
+        p10, p90 = lat[int(n * 0.1)], lat[int(n * 0.9)]
+
+        # 지연과 이동거리의 상관 — 완료 응답이라면 양의 상관이 나와야 한다
+        corr = float('nan')
+        if n >= 10:
+            mx = sum(mv_recent) / n
+            my = sum(lat_recent) / n
+            num = sum((mv_recent[i] - mx) * (lat_recent[i] - my) for i in range(n))
+            dx = sum((v - mx) ** 2 for v in mv_recent)
+            dy = sum((v - my) ** 2 for v in lat_recent)
+            if dx > 1e-9 and dy > 1e-9:
+                corr = num / (dx ** 0.5 * dy ** 0.5)
+
+        # 판정
+        if med < 15.0:
+            verdict = "★ 파싱 응답 — 명령이 펌웨어 버퍼에 쌓이는 중"
+        elif med > 60.0 and (corr != corr or corr > 0.3):
+            verdict = "동작 완료 응답 — busy 가드가 설계대로 작동 중"
+        else:
+            verdict = "판정 애매 — 아래 수치를 그대로 공유할 것"
+
+        rate = len(self._ok_lat) / max(now - self._ok_t0, 1e-6)
+        self.get_logger().info(
+            f"[ok측정] 지연 중앙 {med:.1f}ms (10~90%: {p10:.1f}~{p90:.1f}) "
+            f"이동거리 상관 {corr:+.2f}  전송률 {rate:.1f}회/초  "
+            f"표본 {len(self._ok_lat)}  →  {verdict}")
+
     def _try_send_pending(self):
         if self.is_homing:
             return
@@ -283,6 +383,19 @@ class MirobotDriverNode(Node):
 
         if self.busy:
             if self.ok_seen_count > self._expected_ok_count:
+                # ── [측정] 'ok' 응답 지연 ─────────────────────────────────
+                # 이 노드는 "WLKATA 펌웨어가 동작을 끝낸 뒤에 'ok'를 준다"고
+                # 가정하고 설계됐지만, 그 가정은 검증된 적이 없다.
+                # 표준 GRBL은 명령을 '파싱'했을 때 바로 'ok'를 돌려준다.
+                #
+                #   1~5ms 로 일정      → 파싱 응답. busy 가드가 무력화되고
+                #                        명령이 펌웨어 플래너 버퍼에 쌓인다.
+                #                        (손을 멈춰도 로봇이 옛 명령을 재생)
+                #   80~250ms, 변동     → 동작 완료 응답. 설계대로 동작 중.
+                #
+                # 이동 거리도 같이 남긴다. 완료 응답이라면 거리가 클수록
+                # 지연도 길어야 한다 — 상관이 없으면 파싱 응답이라는 뜻.
+                self._log_ok_latency((now - self.busy_since) * 1000.0)
                 self.busy = False
             elif now - self.busy_since > self.BUSY_TIMEOUT:
                 # 안전장치: 'ok'를 못 받았어도 너무 오래 막혀있지 않도록 강제 해제
@@ -295,7 +408,15 @@ class MirobotDriverNode(Node):
         if self.pending_joint_target is not None:
             target = self.pending_joint_target
             self.pending_joint_target = None
-            gcode = f"G0 X{target[0]:.2f} Y{target[1]:.2f} Z{target[2]:.2f} A{target[3]:.2f} B{target[4]:.2f} C{target[5]:.2f} F2000\r\n"
+            # 이번 명령의 이동량(직전 전송값 대비 관절 변화 합). 'ok' 지연이
+            # 동작 완료를 뜻한다면 이 값과 지연이 비례해야 한다.
+            if self._last_sent_joints is not None:
+                self._pending_move_deg = sum(
+                    abs(target[i] - self._last_sent_joints[i]) for i in range(6))
+            else:
+                self._pending_move_deg = 0.0
+            self._last_sent_joints = list(target)
+            gcode = f"G0 X{target[0]:.2f} Y{target[1]:.2f} Z{target[2]:.2f} A{target[3]:.2f} B{target[4]:.2f} C{target[5]:.2f} F600\r\n"
             self._dispatch(gcode, f"Sent Joint G-Code: {gcode.strip()}")
 
         elif self.pending_gripper_target is not None:

@@ -30,10 +30,8 @@ setup(
     entry_points={
         'console_scripts': [
             'robot_node = mirobot_ai_control.robot_node:main',
-            'ai_node = mirobot_ai_control.ai_node:main',
             'ai_node_new = mirobot_ai_control.ai_node_new:main',
             'robot_cam_node = mirobot_ai_control.robot_cam_node:main',
-            'gui_node = mirobot_ai_control.gui_node:main',
             'logger_node = mirobot_ai_control.ai_node_new_test_logger:main',
         ],
     },
