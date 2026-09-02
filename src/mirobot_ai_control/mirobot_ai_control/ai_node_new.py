@@ -971,6 +971,29 @@ class MirobotAiNode(Node):
     MODE_TRANSITION_LOCK_SEC = 1.0    # 전환 직후 양쪽 모두 발행 금지
     MODE_DEBUG_PERIOD_SEC    = 2.0    # [모드판정] 로그 주기(초). 0이면 끔
 
+    # ── BASE 모드 진입 시 팔 정리 자세 ──────────────────────────────────
+    # 주행 중에는 팔이 제스처를 따르지 않으므로, 뻗은 채로 두면 그대로 들고
+    # 달리게 된다. 진입 순간에 한 번 고정 자세를 보내 접고, 팔에 달린 카메라를
+    # 정면으로 돌려 주행 시야를 확보한다.
+    #
+    # 툴 방향은 theta = J2 + J3 + J5 로 정해진다(_solve_j5 참고).
+    #   theta   0° → 그리퍼 수직 아래
+    #   theta -90° → 그리퍼 정면 수평   ← 주행 카메라는 이것
+    # 아래 값은 theta = -45 + 4 + (-49) = -90 을 만족한다.
+    #
+    # 순기구학으로 검증한 결과 (호밍 자세와 비교):
+    #                  J2/J3/J5      툴끝 전방   카메라 높이   리밋 여유
+    #   호밍 자세      0 / 0 / -90     288mm       255mm        50°
+    #   이 자세      -45 / 4 / -49     158mm       329mm        15°
+    #
+    # [주의] 자기간섭(팔이 자기 몸체나 베이스에 닿는지)은 계산으로 확인할 수
+    # 없다. 처음 쓰기 전에 아래 명령으로 팔만 따로 보내 눈으로 확인할 것:
+    #   ros2 topic pub --once /mirobot/ai_joint_commands \
+    #     std_msgs/Float32MultiArray "{data: [0,-45,4,0,-49,0]}"
+    # 간섭이 있으면 J2 를 0 쪽으로 되돌릴수록 호밍 자세에 가까워진다.
+    MODE_STOW_ON_BASE = True
+    MODE_STOW_JOINTS  = (0.0, -45.0, 4.0, 0.0, -49.0, 0.0)   # J1..J6
+
     # ══════════════════════════════════════════════════════
     #  6) 호밍 안전 (★ 절대 타협 금지 영역 ★)
     #
@@ -2883,6 +2906,48 @@ class MirobotAiNode(Node):
         self.get_logger().info(
             f"[모드] {new_mode.upper()} 모드로 전환 — "
             f"{self.MODE_TRANSITION_LOCK_SEC:.1f}초 동안 양쪽 모두 발행 금지")
+
+        # 팔 정리는 상태 리셋 '뒤' 에 보낸다. 리셋이 목표점·필터·홀드값을
+        # 비우므로, 먼저 보내면 그 명령의 흔적까지 같이 지워진다.
+        if new_mode == 'base' and self.MODE_STOW_ON_BASE:
+            self._publish_stow_pose()
+
+    def _publish_stow_pose(self):
+        """BASE 진입 시 팔을 접고 카메라를 정면으로 돌린다.
+
+        제스처 발행 게이트를 거치지 않고 직접 보낸다. 전환 직후는
+        mode_lock_until 로 제스처 명령이 막혀 있는 구간이라, 게이트를 타면
+        이 명령도 같이 막힌다. 한 번만 보내므로 연속 발행 부담도 없다.
+
+        last_published_* 를 같이 갱신하는 이유는 데드밴드 때문이다. ARM 으로
+        돌아와 첫 명령을 낼 때 직전 발행값과 비교하는데, 그 값이 전환 전 자세인
+        채로 남아 있으면 실제 로봇 자세(접힌 상태)와 어긋난 판정을 하게 된다.
+        """
+        out = list(self.MODE_STOW_JOINTS)
+        for i, (lo, hi) in enumerate(self.JOINT_SOFT_LIMITS):
+            out[i] = max(lo, min(hi, out[i]))
+
+        msg = Float32MultiArray()
+        msg.data = [float(v) for v in out]
+        self.ai_joints_pub.publish(msg)
+
+        self.last_published_joints = list(out)
+        # 카테시안 기준은 무효화한다. 이 자세는 IK 로 만든 것이 아니라 관절각을
+        # 직접 준 것이라, 대응하는 목표점이 없다. None 이면 다음 발행에서
+        # 데드밴드를 건너뛰고 무조건 한 번 내보낸다.
+        self.last_published_cart = None
+
+        r, z = None, None
+        try:
+            _x, _y, z = self._fk_wrist(out[0], out[1], out[2])
+            r = math.hypot(_x, _y)
+        except Exception:
+            pass
+        theta = out[1] + out[2] + out[4]
+        self.get_logger().info(
+            f"[모드] 팔 정리 자세 발행 J1~J6={[round(v, 1) for v in out]} "
+            f"(툴 방향 {theta:+.0f}° {'정면 수평' if abs(theta + 90) < 15 else ''}"
+            + (f", 손목 r{r:.0f} z{z:.0f}mm" if r is not None else "") + ")")
 
     def base_arm(self):
         """베이스 주행을 맡는 팔. 제어팔의 반대쪽이다."""
