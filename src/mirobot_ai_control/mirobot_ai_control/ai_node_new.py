@@ -208,7 +208,7 @@ class MirobotAiNode(Node):
 
     # 그리퍼 길이 (J5축 → 집게 끝). Z_MIN 안전 여유 계산에만 쓰임.
     # 실측해서 넣으면 더 정확해짐. 몰라도 동작에는 지장 없음.
-    LINK_TOOL_MM = 100.0
+    LINK_TOOL_MM = 90.0
 
     # ══════════════════════════════════════════════════════
     #  2) 로봇 작업공간 한계 (mm, 베이스 좌표계)
@@ -268,8 +268,12 @@ class MirobotAiNode(Node):
     # [현장 정보] 메카넘 바닥 → 미로봇 베이스 바닥면 = 약 85mm.
     #   → 지면 위 물체를 집으려면 Z_MIN을 음수로 낮춰야 하지만, 우선은
     #     "플랫폼 상판을 절대 찍지 않는" 안전값으로 시작하고 실측 후 조정 권장.
-    WS_Z_MIN_MM = 40.0
+    WS_Z_MIN_MM = 10.0
     WS_Z_MAX_MM = 340.0
+    # J2 펌웨어 범위는 -35~+70도다. 여유 3도를 두고 목표점 단계에서 막는다.
+    # (IK 뒤 관절각 클램프만으로는 목표점과 실제 자세가 어긋나 튄다)
+    WS_J2_MAX_DEG = 67.0
+    WS_J2_MIN_DEG = -32.0
 
     # ── WORKSPACE EDGE 표시 기준 ─────────────────────────────────────────
     # 기존에는 클램프가 0.001mm만 잘라내도 배지가 떴다. 필터 출력이 경계를
@@ -337,7 +341,7 @@ class MirobotAiNode(Node):
     # [주의] 위의 WS_*_MM(작업공간 한계)과 헷갈리지 않도록 MAP_ 접두사를 씀.
     #        이 네 점은 모두 도달 가능 영역 안에 있어야 함(전수검사로 확인 완료).
     MAP_X_NEUTRAL = 198.0   # 중립 자세일 때 로봇이 있을 앞뒤 위치
-    MAP_X_MAX     = 250.0   # 최대로 앞으로 뻗었을 때
+    MAP_X_MAX     = 262.0   # 최대로 앞으로 뻗었을 때
     MAP_Z_NEUTRAL = 255.0   # 중립 자세일 때 높이
     MAP_Z_MAX     = 330.0   # 최대로 위로 들었을 때 (WS_Z_MAX_MM 와 동일)
 
@@ -348,7 +352,7 @@ class MirobotAiNode(Node):
     # 사람이 팔을 뒤로 빼는 범위는 앞으로 뻗는 범위보다 좁으므로 1.0 보다
     # 작은 값이 맞다. 뒤로 잘 안 가면 줄이고, 너무 예민하면 키운다.
     MAP_X_MIN           = 150.0   # 최대로 뒤로 뺐을 때 (WS_X_MIN_MM=70 보다 여유)
-    MAP_BACK_SPAN_SCALE =   0.17   # 뒤쪽 사람 가동범위 = fwd_span * 이 값
+    MAP_FWD_BACK_MIN    =   0.35  # 손을 몸쪽으로 당겼을 때의 norm_fwd (절대 기준)
     # ── 아래 방향 z 매핑 ──────────────────────────────────────────────────
     # [왜 따로 필요한가]
     #   MAP_Z_NEUTRAL 은 호밍 자세(전 관절 0°)의 손목 높이 255mm 에 맞춰져 있다.
@@ -370,8 +374,8 @@ class MirobotAiNode(Node):
     #   배율을 곱해 추정한다. 사람은 팔을 위로 드는 범위가 아래로 내리는
     #   범위보다 넓으므로 1.0 보다 작은 값이 맞다.
     #   아래로 잘 안 내려가면 이 값을 키우고(0.8), 너무 예민하면 줄인다(0.4).
-    MAP_Z_MIN            =  60.0   # 최대로 내렸을 때 (WS_Z_MIN_MM=40 보다 여유)
-    MAP_DOWN_SPAN_SCALE  =   3.5   # 아래쪽 사람 가동범위 = up_span * 이 값
+    MAP_Z_MIN            =  15.0   # 최대로 내렸을 때 (WS_Z_MIN_MM=10 보다 여유)
+    MAP_UP_DOWN_MIN      =  -0.35  # 팔을 앞아래로 곧게 뻗었을 때의 norm_up (절대 기준)
     # ── 좌우: J1 각도로 직접 매핑 ────────────────────────────────────────
     # [왜 y 거리가 아니라 각도인가]
     #   예전에는 raw_y 를 mm 로 더했다. 그러면 옆으로 갈수록 반경
@@ -395,7 +399,8 @@ class MirobotAiNode(Node):
     MAP_J1_MAX_DEG  =  70.0   # 대칭 상한. WS_YAW_MAX_DEG(85) 안쪽으로 둔다
 
     # 캘리브레이션 범위가 이보다 좁으면 자세를 잘못 취한 것으로 보고 실패 처리
-    CALIB_MIN_RANGE_NORM = 0.18
+    CALIB_REACH_PCTL = 100.0   # 뻗기 단계는 평균이 아니라 이 백분위수를 쓴다
+    CALIB_MIN_RANGE_NORM = 0.12
 
     # ══════════════════════════════════════════════════════
     #  4) 툴 피치 (J5)
@@ -425,6 +430,12 @@ class MirobotAiNode(Node):
     TOOL_PITCH_FRONT    =   0.0   # 손목을 안쪽으로    → 수직 아래 (책상 위 집기)
 
     # True면 위 보상 사용, False면 v1처럼 J5에 직접 매핑(비교/폴백용)
+    # 손이 낮은 높이로 내려갈수록 툴 피치를 수직(아래)으로 끌어당긴다.
+    # 바닥 근처 물건을 집을 때 그리퍼가 비스듬해지는 문제를 막는다.
+    TOOL_PITCH_AUTO     = True
+    TOOL_PITCH_AUTO_HI  = 80.0   # 이 높이 위로는 개입 안 함
+    TOOL_PITCH_AUTO_LO  = 30.0   # 이 높이 아래는 완전 수직
+    TOOL_PITCH_AUTO_TGT =  0.0   # 수직 아래
     TOOL_PITCH_COMPENSATION = True
 
     # ── J5 손목 3점 보간 입력 기준각 (사람 손목) ─────────────────────────────
@@ -465,7 +476,7 @@ class MirobotAiNode(Node):
     #   - J5(꺾기)와 직교한다. J5 는 축에 수직인 성분, J6 는 축 둘레의 성분.
     #   - 중립 기준각을 캘리브레이션에서 재서 빼므로 중립이 0 이 된다.
     #   - 언랩 → 필터 → 클램프 순서라 슬램이 원리적으로 사라진다.
-    ENABLE_J6 = True
+    ENABLE_J6 = False
 
     # 부호. 손을 어느 쪽으로 비틀 때 그리퍼가 어느 쪽으로 도는지는 실기로만
     # 알 수 있다. 아래 [J6] 로그로 확인하고, 반대면 -1.0 으로 바꿀 것.
@@ -641,9 +652,9 @@ class MirobotAiNode(Node):
     # 카테시안 좌표(mm)에 걸어서 필터 특성이 예측 가능하게 만듦.
     # 단위가 deg → mm 로 바뀌었으므로 beta 값이 v1보다 훨씬 작아야 함
     # (속도가 mm/s 단위라 값 자체가 크기 때문).
-    CART_MIN_CUTOFF = 1.2
-    CART_BETA       = 0.015
-    CART_D_CUTOFF   = 1.0
+    CART_MIN_CUTOFF = 0.9
+    CART_BETA       = 0.005
+    CART_D_CUTOFF   = 0.4
 
     # cutoff 상한(Hz). None 이면 비활성(기존 동작).
     #
@@ -2480,10 +2491,60 @@ class MirobotAiNode(Node):
             #  arccos 인자를 다시 클램프하므로 발산하지 않음)
             z = max(self.WS_Z_MIN_MM, min(self.WS_Z_MAX_MM, z))
 
+        # 6) J2 여유 확보 — 높이(Z)는 그대로 두고 반경(R)만 당긴다.
+        #    J2 는 R 에 대해 단조증가이므로 이분법이 성립한다.
+        R = math.hypot(x, y) - self.LINK_A1_MM
+        Z = z - self.LINK_D1_MM
+        _j2 = self._j2_for(R, Z)
+        _hit = False
+        if _j2 > self.WS_J2_MAX_DEG:        # 너무 뻗음 → 반경을 당긴다
+            lo, hi = 0.0, R
+            for _ in range(40):
+                mid = 0.5 * (lo + hi)
+                if self._j2_for(mid, Z) > self.WS_J2_MAX_DEG:
+                    hi = mid
+                else:
+                    lo = mid
+            R = lo; _hit = True
+        elif _j2 < self.WS_J2_MIN_DEG:      # 너무 당김 → 반경을 밀어낸다
+            lo, hi = R, R + 400.0
+            for _ in range(40):
+                mid = 0.5 * (lo + hi)
+                if self._j2_for(mid, Z) < self.WS_J2_MIN_DEG:
+                    lo = mid
+                else:
+                    hi = mid
+            R = hi; _hit = True
+        if _hit:
+            D = math.hypot(R, Z)
+            if 1e-6 < D < self.WS_D_MIN_MM:
+                R *= self.WS_D_MIN_MM / D
+            elif D > self.WS_D_MAX_MM:
+                R *= self.WS_D_MAX_MM / D
+            r_old = math.hypot(x, y)
+            r_new = R + self.LINK_A1_MM
+            if r_old > 1e-6:
+                x, y = x / r_old * r_new, y / r_old * r_new
+            else:
+                x, y = r_new, 0.0
+            clamped = True
+            reason = 'J2_MAX'
+
         # 실제로 목표점이 얼마나 밀려났는지(mm). 배지/로그 판정에 쓰인다.
         mag = math.sqrt((x - x0) ** 2 + (y - y0) ** 2 + (z - z0) ** 2) if clamped else 0.0
 
         return x, y, z, clamped, reason, mag
+
+    def _j2_for(self, R, Z):
+        """J2 축 기준 (R, Z) 에 대한 J2 각도(도). 클램프 판정 전용."""
+        D2 = R * R + Z * Z
+        cd = (D2 - self.LINK_L2_MM ** 2 - self.LINK_L3_MM ** 2) / \
+             (2.0 * self.LINK_L2_MM * self.LINK_L3_MM)
+        delta = math.acos(max(-1.0, min(1.0, cd)))
+        return math.degrees(
+            math.atan2(R, Z)
+            - math.atan2(self.LINK_L3_MM * math.sin(delta),
+                         self.LINK_L2_MM + self.LINK_L3_MM * math.cos(delta)))
 
     def _ik_position(self, x, y, z):
         """
@@ -3231,9 +3292,19 @@ class MirobotAiNode(Node):
         # 대신 "정규화된 손목 위치"의 기준점과 최대치를 잰다.
         if stage in ('neutral', 'reach_forward', 'reach_up', 'reach_side'):
             n = len(self.calib_samples_pos)
+
+            def _pctl(idx, p):
+                """샘플의 상위 p 백분위수. 과도 구간을 걸러내기 위해 쓴다."""
+                v = sorted(sm[idx] for sm in self.calib_samples_pos)
+                k = min(len(v) - 1, max(0, int(round((p / 100.0) * (len(v) - 1)))))
+                return v[k]
+
             avg_fwd = sum(s[0] for s in self.calib_samples_pos) / n
             avg_lat = sum(s[1] for s in self.calib_samples_pos) / n
             avg_up  = sum(s[2] for s in self.calib_samples_pos) / n
+            # 뻗기 단계는 최대치를 재는 것이므로 평균 대신 상위 백분위수를 쓴다.
+            top_fwd = _pctl(0, self.CALIB_REACH_PCTL)
+            top_up  = _pctl(2, self.CALIB_REACH_PCTL)
 
             if stage == 'neutral':
                 self.CAL_FWD_NEUTRAL = avg_fwd
@@ -3331,8 +3402,10 @@ class MirobotAiNode(Node):
                     f"[캘리브레이션] 중립 fwd={avg_fwd:.3f} lat={avg_lat:.3f} up={avg_up:.3f}")
 
             elif stage == 'reach_forward':
-                self.CAL_FWD_MAX = avg_fwd
-                self.get_logger().info(f"[캘리브레이션] 최대 전방 fwd={avg_fwd:.3f}")
+                self.CAL_FWD_MAX = top_fwd
+                self.get_logger().info(
+                    f"[캘리브레이션] 최대 전방 fwd={top_fwd:.3f} "
+                    f"(상위{self.CALIB_REACH_PCTL:.0f}%, 평균 {avg_fwd:.3f})")
                 if (self.CAL_FWD_MAX - self.CAL_FWD_NEUTRAL) < self.CALIB_MIN_RANGE_NORM:
                     self.CAL_FWD_MAX = MirobotAiNode.CAL_FWD_MAX
                     self._calib_fail(current_idx,
@@ -3341,8 +3414,10 @@ class MirobotAiNode(Node):
                     return
 
             elif stage == 'reach_up':
-                self.CAL_UP_MAX = avg_up
-                self.get_logger().info(f"[캘리브레이션] 최대 상방 up={avg_up:.3f}")
+                self.CAL_UP_MAX = top_up
+                self.get_logger().info(
+                    f"[캘리브레이션] 최대 상방 up={top_up:.3f} "
+                    f"(상위{self.CALIB_REACH_PCTL:.0f}%, 평균 {avg_up:.3f})")
                 if (self.CAL_UP_MAX - self.CAL_UP_NEUTRAL) < self.CALIB_MIN_RANGE_NORM:
                     self.CAL_UP_MAX = MirobotAiNode.CAL_UP_MAX
                     self._calib_fail(current_idx,
@@ -4414,9 +4489,16 @@ class MirobotAiNode(Node):
             if d_fwd >= 0.0:
                 g_f = g_fwd
             else:
-                back_span = max(fwd_span * self.MAP_BACK_SPAN_SCALE, 0.10)
+                # 후방도 fwd_span 과 무관하게 절대 기준 (상수 주석 참고)
+                back_span = max(
+                    self.CAL_FWD_NEUTRAL - self.MAP_FWD_BACK_MIN, 0.10)
                 g_f = (self.MAP_X_NEUTRAL - self.MAP_X_MIN) / back_span
-            r_fwd = self.MAP_X_NEUTRAL + g_f * d_fwd
+            # 선형식이 범위 밖으로 새는 것을 막는다. 이게 없으면 손을 조금만
+            # 당겨도 r_fwd 가 음수까지 가고, WS_X_MIN(70) 클램프가 발동하며
+            # j1_lim=0 이 되어 좌우 조작까지 죽었다.
+            r_fwd = max(self.MAP_X_MIN,
+                        min(self.MAP_X_MAX,
+                            self.MAP_X_NEUTRAL + g_f * d_fwd))
 
             j1_cmd = self.MAP_J1_GAIN_DEG * (norm_lat - self.CAL_LAT_NEUTRAL)
             # x >= WS_X_MIN_MM 을 유지할 수 있는 각도 상한. 반경이 짧을수록
@@ -4444,8 +4526,11 @@ class MirobotAiNode(Node):
             if d_up >= 0.0:
                 g_up = (self.MAP_Z_MAX - self.MAP_Z_NEUTRAL) / up_span
             else:
-                # 아래쪽 사람 가동범위는 실측값이 없으므로 위쪽에 배율을 곱해 추정
-                down_span = max(up_span * self.MAP_DOWN_SPAN_SCALE, 0.10)
+                # 아래쪽 가동범위는 up_span 과 무관하게 절대 기준으로 잡는다.
+                # (up_span 배수를 쓰면 캘리브레이션 품질에 따라 하강게인이
+                #  3배까지 흔들려 "안 내려감" 증상이 재발한다)
+                down_span = max(
+                    self.CAL_UP_NEUTRAL - self.MAP_UP_DOWN_MIN, 0.10)
                 g_up = (self.MAP_Z_NEUTRAL - self.MAP_Z_MIN) / down_span
             raw_z = self.MAP_Z_NEUTRAL + g_up * d_up
             if self.GRU_DEBUG_LOG:
@@ -4533,7 +4618,15 @@ class MirobotAiNode(Node):
 
             # 역기구학
             j1, j2, j3, ik_ok = self._ik_position(cx, cy, cz)
-            j5, j5_sat = self._solve_j5(self.tool_pitch_deg, j2, j3)
+            # 낮은 높이일수록 툴 피치를 수직으로 끌어당긴다 (상수 주석 참고).
+            # 원본 tool_pitch_deg 는 건드리지 않는다 — 손을 올리면 그대로 복귀.
+            pitch_cmd = self.tool_pitch_deg
+            if self.TOOL_PITCH_AUTO:
+                _hi, _lo = self.TOOL_PITCH_AUTO_HI, self.TOOL_PITCH_AUTO_LO
+                _t = 0.0 if _hi <= _lo else (_hi - cz) / (_hi - _lo)
+                _t = max(0.0, min(1.0, _t))
+                pitch_cmd = (1.0 - _t) * pitch_cmd + _t * self.TOOL_PITCH_AUTO_TGT
+            j5, j5_sat = self._solve_j5(pitch_cmd, j2, j3)
             j6 = self.j6_deg if self.ENABLE_J6 else 0.0
 
             self.last_ik = (j1, j2, j3)
