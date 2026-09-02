@@ -3428,9 +3428,24 @@ class MirobotAiNode(Node):
             elif stage == 'reach_side':
                 # 좌우 폭. 중립에서 얼마나 벌어졌는지의 '절대값'이 스팬이다.
                 # 부호는 어느 팔이냐에 따라 달라지므로 여기서 없앤다.
-                span = abs(avg_lat - self.CAL_LAT_NEUTRAL)
+                #
+                # 다른 뻗기 단계와 같이 상위 백분위수를 쓴다. 평균을 쓰면 팔을
+                # 벌리는 과도 구간 프레임이 섞여 실제 최대치보다 작게 나오고,
+                # 그러면 CALIB_MIN_RANGE_NORM 검사에 걸려 재시도하게 된다
+                # (실측에서 평균 기준으로 0.113 / 0.082 가 나와 두 번 거부됐다).
+                #
+                # top_fwd/top_up 처럼 _pctl 을 그대로 쓰지 않는 이유는 부호다.
+                # 어느 팔이냐에 따라 벌리는 방향이 +도 -도 되므로, 중립 대비
+                # 편차의 절대값에서 백분위수를 뽑아야 방향에 무관해진다.
+                _devs = sorted(abs(sm[1] - self.CAL_LAT_NEUTRAL)
+                               for sm in self.calib_samples_pos)
+                _k = min(len(_devs) - 1,
+                         max(0, int(round((self.CALIB_REACH_PCTL / 100.0)
+                                          * (len(_devs) - 1)))))
+                span = _devs[_k]
                 self.get_logger().info(
-                    f"[캘리브레이션] 최대 측방 lat={avg_lat:.3f} → 좌우 스팬 "
+                    f"[캘리브레이션] 최대 측방 lat={avg_lat:+.3f}(평균) "
+                    f"편차 p{self.CALIB_REACH_PCTL:.0f} → 좌우 스팬 "
                     f"{span:.3f} (예전 고정값 {MirobotAiNode.BASE_LAT_SPAN})")
                 if span < self.CALIB_MIN_RANGE_NORM:
                     self._calib_fail(current_idx,
