@@ -28,7 +28,15 @@
 # ══════════════════════════════════════════════════════════════════════════
 
 ROS_DISTRO_NAME="jazzy"
-MIROBOT_WS="$HOME/mirobot"
+
+# 이 스크립트가 들어있는 워크스페이스를 쓴다. 경로를 박아두지 않는 이유는
+# git worktree 로 사람마다 작업 디렉토리를 나눠 쓰기 때문이다.
+#   ~/mirobot/start_petmate.sh       → ~/mirobot 을 씀
+#   ~/mirobot-taro/start_petmate.sh  → ~/mirobot-taro 를 씀
+# 각 worktree 에 이 스크립트 사본이 있으므로 자기 디렉토리 것을 실행하면
+# 알아서 맞는 워크스페이스가 잡힌다. readlink -f 는 ~/start_petmate.sh
+# 같은 심볼릭 링크를 실제 위치로 풀기 위한 것이다.
+MIROBOT_WS="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 BASE_WS="$HOME/ros2_ws"
 WEBGUI_DIR="$HOME/mirobot_web_gui"
 CERT_DIR="$HOME/webgui_certs"
@@ -107,7 +115,7 @@ fi
 [ -f "$MIROBOT_WS/install/setup.bash" ] || die "미로봇 워크스페이스 빌드 필요:
        cd $MIROBOT_WS && colcon build --packages-select $MIROBOT_PKG"
 source "$MIROBOT_WS/install/setup.bash"
-ok "미로봇 워크스페이스: $MIROBOT_WS"
+ok "미로봇 워크스페이스: $MIROBOT_WS  (브랜치: $(git -C "$MIROBOT_WS" branch --show-current 2>/dev/null || echo '?'))"
 
 [ -f "$CERT_DIR/cert.pem" ] && [ -f "$CERT_DIR/key.pem" ] \
   || die "인증서 없음: $CERT_DIR  ($WEBGUI_DIR/setup_https.sh 실행)"
