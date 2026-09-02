@@ -6,8 +6,9 @@
 #    1) rosbridge      (9090, WSS)  — 웹 GUI ↔ ROS2
 #    2) mecanum_driver              — 메카넘 베이스 (별도 워크스페이스)
 #    3) robot_node                  — Mirobot 팔 드라이버  [--no-arm 으로 생략]
-#    4) ai_node_new    (5000/5001)  — MediaPipe + 제스처 제어  [--no-ai 로 생략]
-#    5) https_server   (8443)       — 웹 GUI
+#    4) robot_cam_node (5002)       — 로봇 탑재 카메라 MJPEG 릴레이
+#    5) ai_node_new    (5000/5001)  — MediaPipe + 제스처 제어  [--no-ai 로 생략]
+#    6) https_server   (8443)       — 웹 GUI
 #
 #  워크스페이스를 합치지 않는 이유
 #    ROS2 오버레이 방식이 표준이고, 한쪽만 고쳐도 전체를 다시 빌드하지 않아도
@@ -136,7 +137,7 @@ if $USE_ARM; then
 fi
 
 # 이전 실행이 포트를 쥐고 있으면 새 프로세스가 조용히 죽는다.
-for port in 9090 8443 5000 5001; do
+for port in 9090 8443 5000 5001 5002; do
   if ss -ltn 2>/dev/null | grep -q ":$port "; then
     warn "포트 $port 사용 중 — 이전 실행이 남아있습니다."
     warn "  정리:  pkill -f 'ai_node_new|rosbridge|https_server|$BASE_EXEC'"
@@ -168,6 +169,12 @@ $USE_BASE && launch "메카넘 드라이버" "mecanum.log" \
 $USE_ARM && launch "robot_node (Mirobot 팔)" "robot_node.log" \
   ros2 run "$MIROBOT_PKG" robot_node
 
+# 로봇 탑재 카메라 릴레이(5002). rpicam-vid 의 MJPEG 을 재인코딩 없이 넘기므로
+# 부하가 거의 없다. 팔 없이 테스트할 때도 주행 시야는 필요하므로 --no-arm 과
+# 무관하게 띄운다. 카메라가 없으면 이 노드만 재기동을 반복하고 나머지는 정상.
+launch "로봇 카메라 (5002)" "robot_cam.log" \
+  ros2 run "$MIROBOT_PKG" robot_cam_node
+
 # ai_node 는 팔 호밍이 끝난 뒤 붙는 편이 안전하다.
 # 호밍 중에 제스처 목표값이 들어가면 낡은 값 재생 문제가 생길 수 있다.
 $USE_ARM && $USE_AI && { say "호밍 대기 (5초)"; sleep 5; }
@@ -196,6 +203,7 @@ for _ip in $ALL_IPS; do
   echo -e "  ${C_Y}처음 접속하는 기기라면${C_0} 아래 세 곳도 먼저 열어 인증서를 승인:"
   echo -e "    ${C_B}https://$_ip:5000/video_feed${C_0}"
   echo -e "    ${C_B}https://$_ip:5001${C_0}"
+  echo -e "    ${C_B}https://$_ip:5002${C_0}   (로봇 카메라)"
   echo -e "    ${C_B}https://$_ip:9090${C_0}"
   echo -e "  그리고 IP 입력칸에 ${C_B}$_ip${C_0} — 페이지를 연 주소와 같은 것을 넣으세요."
   echo ""

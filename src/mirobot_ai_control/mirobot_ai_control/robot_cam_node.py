@@ -31,6 +31,7 @@ import os
 import time
 import signal
 import threading
+import re
 import subprocess
 
 import rclpy
@@ -42,6 +43,11 @@ from flask import Flask, Response
 PORT = 5002
 
 # 모드 → 카메라 번호. 실기에서 반대면 이 두 값만 바꾼다.
+#
+# [주의] 여기 적힌 카메라가 실제로 없으면 rpicam-vid 가 즉시 죽고, 리더가
+# 빈 읽기를 받아 '종료됨 → 재기동' 루프에 빠진다. 주행 시야가 가장 필요한
+# 순간에 스트림이 끊기므로, 기동 시 실제 장착된 카메라를 확인해서 없는
+# 번호는 있는 것으로 대체한다(_resolve_cam_map).
 CAM_FOR_MODE = {'arm': 0, 'base': 1}
 DEFAULT_MODE = 'arm'
 
@@ -68,8 +74,9 @@ class RobotCamNode(Node):
         self.latest_jpeg = None
         self.jpeg_lock = threading.Lock()
 
+        self.cam_for_mode = self._resolve_cam_map()
         self.mode = DEFAULT_MODE
-        self.desired_cam = CAM_FOR_MODE[DEFAULT_MODE]
+        self.desired_cam = self.cam_for_mode[DEFAULT_MODE]
         self.active_cam = None
         self.switch_request_t = 0.0
         self.proc = None
@@ -85,24 +92,70 @@ class RobotCamNode(Node):
 
         self.get_logger().info(
             f"로봇 카메라 노드 시작 — 포트 {PORT}, "
-            f"{WIDTH}x{HEIGHT}@{FPS}fps, arm=cam{CAM_FOR_MODE['arm']} "
-            f"base=cam{CAM_FOR_MODE['base']}")
+            f"{WIDTH}x{HEIGHT}@{FPS}fps, arm=cam{self.cam_for_mode['arm']} "
+            f"base=cam{self.cam_for_mode['base']}")
 
     # ── 모드 구독 ─────────────────────────────────────────────────────────
     def _mode_callback(self, msg):
         mode = msg.data.strip().lower()
-        if mode not in CAM_FOR_MODE:
+        if mode not in self.cam_for_mode:
             return
         if mode == self.mode:
             return
         self.mode = mode
-        self.desired_cam = CAM_FOR_MODE[mode]
+        self.desired_cam = self.cam_for_mode[mode]
         self.switch_request_t = time.time()
         self.get_logger().info(
             f"[모드] {mode.upper()} — cam{self.desired_cam} 로 전환 예정 "
             f"({SWITCH_DEBOUNCE_SEC:.1f}초 후)")
 
     # ── rpicam-vid 관리 ───────────────────────────────────────────────────
+    @staticmethod
+    def _available_cams():
+        """실제로 장착된 카메라 번호 목록. 확인 불가하면 빈 리스트.
+
+        rpicam-hello --list-cameras 의 출력에서 '0 : imx219 ...' 형태의
+        선두 숫자를 뽑는다. 실패하면 판단을 포기하고 빈 리스트를 돌려주어,
+        호출부가 기존 매핑을 그대로 쓰도록 한다(잘못 추측해 멀쩡한 설정을
+        덮어쓰는 것보다 낫다).
+        """
+        try:
+            out = subprocess.run(['rpicam-hello', '--list-cameras'],
+                                 capture_output=True, text=True, timeout=10).stdout
+        except Exception:
+            return []
+        cams = []
+        for line in out.splitlines():
+            m = re.match(r'\s*(\d+)\s*:', line)
+            if m:
+                cams.append(int(m.group(1)))
+        return sorted(set(cams))
+
+    def _resolve_cam_map(self):
+        """CAM_FOR_MODE 에서 존재하지 않는 카메라를 있는 것으로 대체한다.
+
+        카메라가 하나뿐인 구성에서 base 모드로 넘어가면 없는 cam1 을 띄우려다
+        스트림이 통째로 끊긴다. 그럴 바엔 같은 카메라를 계속 보여주는 편이 낫다.
+        나중에 두 번째 카메라를 달면 이 함수가 알아서 원래 매핑을 쓴다.
+        """
+        avail = self._available_cams()
+        if not avail:
+            self.get_logger().warn(
+                "카메라 목록을 확인하지 못했습니다 — 설정값을 그대로 씁니다.")
+            return dict(CAM_FOR_MODE)
+        fallback = avail[0]
+        resolved = {}
+        for mode, cam in CAM_FOR_MODE.items():
+            if cam in avail:
+                resolved[mode] = cam
+            else:
+                resolved[mode] = fallback
+                self.get_logger().warn(
+                    f"{mode.upper()} 모드에 지정된 cam{cam} 이 없습니다 "
+                    f"(장착: {avail}) — cam{fallback} 으로 대체합니다. "
+                    f"두 번째 카메라를 달면 자동으로 원래 설정을 씁니다.")
+        return resolved
+
     def _spawn(self, cam):
         cmd = [
             'rpicam-vid',
