@@ -885,6 +885,13 @@ class MirobotAiNode(Node):
     VY_SIGN            = +1.0    # 실기에서 좌우가 반대로 가면 -1.0
     BASE_SECTOR_DEG    = 45.0
     BASE_SECTOR_HYST   = 8.0     # 섹터 이탈 여유각
+    # 전/후/좌/우(카디널) 섹터를 대각선보다 넓힌다.
+    # 8등분이면 각 섹터가 45°(±22.5°)인데, 전진하려고 팔을 들면 어깨 구조상
+    # 옆으로도 함께 벌어져서 22.5°를 넘기 쉽다. 그러면 곧게 가려는데 자꾸
+    # 대각선으로 튄다. 실제 조작에서 쓰는 빈도도 카디널이 훨씬 높다.
+    #   카디널 폭 = 45 + 2W,  대각선 폭 = 45 - 2W   (합은 360° 유지)
+    #   W=7.5 → 카디널 60°, 대각선 30°
+    BASE_CARDINAL_WIDEN_DEG = 7.5
     BASE_RAMP_STEP     = 0.10    # s 도메인, 20Hz 기준 0→최대 0.5초
     # [수정] 0.20 → 0.40
     #  팔을 높이 들면 손목이 화면 가장자리로 가면서 pos_valid 가 잠깐씩
@@ -996,8 +1003,15 @@ class MirobotAiNode(Node):
     CALIB_STAGES = ['neutral', 'reach_forward', 'reach_up', 'reach_side',
                     'wrist_straight', 'wrist_back', 'wrist_front']
     CALIB_INSTRUCTIONS = {
-        'neutral':        "1/7 단계: 팔꿈치를 편하게 굽혀 몸 앞쪽에 손을 두는 '기본 자세'를 유지하세요. "
-                          "(이 위치가 로봇의 기준 위치가 됩니다)",
+        # [중요] 반대쪽 팔 지시가 빠져 있었다. 이 단계에서 반대쪽 팔도 같이
+        # 재서 주행 조이스틱의 원점으로 쓰는데, 지시가 없으니 그때 팔이 어디
+        # 있었느냐에 따라 값이 1.3(정규화 단위)이나 요동쳤다. 실제로 한 번은
+        # up=-0.936(내린 상태), 다음엔 up=+0.366(든 상태)으로 잡혔다.
+        # 원점이 높게 잡히면 주행 내내 팔을 들고 있어야 하고, 전진 시 d_up 이
+        # 작아져 조금만 옆으로 벌어져도 대각선 섹터로 넘어간다.
+        'neutral':        "1/7 단계: 조작할 팔은 팔꿈치를 편하게 굽혀 몸 앞쪽에 두고, "
+                          "반대쪽 팔은 주행할 때 쉴 자세 그대로 편하게 내리세요. "
+                          "(두 팔이 각각 로봇 팔과 주행의 기준 위치가 됩니다)",
         'reach_forward':  "2/7 단계: 팔을 카메라 쪽으로 최대한 앞으로 뻗은 자세를 유지하세요.",
         'reach_up':       "3/7 단계: 팔을 최대한 위로 들어올린 자세를 유지하세요.",
         # 좌우 가동폭. 예전에는 BASE_LAT_SPAN=0.50 으로 박아뒀는데, 재본 적
@@ -2571,17 +2585,30 @@ class MirobotAiNode(Node):
     #  항상 0 또는 ±0.707·mag 라 경계 근처에 머무는 일 자체가 없어진다.
     # ══════════════════════════════════════════════════════════════════════
 
+    def _sector_half_width(self, i):
+        """섹터 i 의 반각. 짝수(전/후/좌/우)는 넓히고 홀수(대각선)는 좁힌다.
+
+        합이 360°로 유지되므로 섹터들이 빈틈·겹침 없이 딱 맞물린다.
+        """
+        w = self.BASE_CARDINAL_WIDEN_DEG
+        return self.BASE_SECTOR_DEG / 2.0 + (w if i % 2 == 0 else -w)
+
     def _snap_sector(self, theta_deg, prev):
         """방향각을 8섹터로 스냅. 히스테리시스로 경계 채터링을 막는다.
 
-        스냅만으로는 부족하다. 팔이 정확히 섹터 경계(22.5°)에 있으면 이번엔
-        그 경계에서 같은 진동이 난다. 현재 섹터를 벗어나려면 절반각 + 여유각
-        만큼 더 가야 하도록 만들어 왕복을 막는다.
+        스냅만으로는 부족하다. 팔이 정확히 섹터 경계에 있으면 이번엔 그
+        경계에서 같은 진동이 난다. 현재 섹터를 벗어나려면 반각 + 여유각만큼
+        더 가야 하도록 만들어 왕복을 막는다.
         """
         if prev is not None:
             diff = (theta_deg - prev * self.BASE_SECTOR_DEG + 180.0) % 360.0 - 180.0
-            if abs(diff) < self.BASE_SECTOR_DEG / 2.0 + self.BASE_SECTOR_HYST:
+            if abs(diff) < self._sector_half_width(prev) + self.BASE_SECTOR_HYST:
                 return prev
+        for i in range(8):
+            diff = (theta_deg - i * self.BASE_SECTOR_DEG + 180.0) % 360.0 - 180.0
+            if abs(diff) <= self._sector_half_width(i):
+                return i
+        # 부동소수 경계에서 어느 섹터에도 안 걸리면 가장 가까운 것으로.
         return int(round(theta_deg / self.BASE_SECTOR_DEG)) % 8
 
     def _compute_base_cmd(self, norm_lat, norm_up):
@@ -3273,6 +3300,17 @@ class MirobotAiNode(Node):
                     self.CAL_BASE_LAT_NEUTRAL = lat_arr[len(lat_arr) // 2]
                     self.CAL_BASE_UP_NEUTRAL  = up_arr[len(up_arr) // 2]
                     self.CAL_BASE_SET = True
+                    # 주행 원점이 높게 잡히면 조작 내내 팔을 들고 있어야 하고,
+                    # 전진 시 d_up 이 작아져 대각선 섹터로 쉽게 넘어간다.
+                    # 팔을 내린 자세의 up 은 보통 -0.7 아래다.
+                    if self.CAL_BASE_UP_NEUTRAL > -0.40:
+                        self.get_logger().warn(
+                            f"[캘리브레이션] 주행 원점이 높습니다 "
+                            f"(up={self.CAL_BASE_UP_NEUTRAL:+.3f}). 1단계에서 반대쪽 "
+                            f"팔을 들고 계셨던 것 같습니다. 그대로 쓰면 주행 내내 그 "
+                            f"높이를 유지해야 하고, 전진할 때 조금만 옆으로 벌어져도 "
+                            f"대각선으로 넘어갑니다. 반대쪽 팔을 편하게 내린 채로 "
+                            f"다시 캘리브레이션하는 것을 권합니다.")
                     self.get_logger().info(
                         f"[캘리브레이션] 베이스팔({self.base_arm()}) 중립 "
                         f"lat={self.CAL_BASE_LAT_NEUTRAL:+.3f} "
