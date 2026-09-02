@@ -855,25 +855,20 @@ class MirobotAiNode(Node):
     # ─────────── 베이스 조작 상수 ───────────
     # 값의 근거는 실측이다. 전진/좌우 각각 7단계 속도로 오도메트리를 재서
     # 얻은 결과이며, 임의로 바꾸면 조작감이 무너진다.
-    # 정규화 반경. 이하는 정지.
+    # 중립에서 손이 이만큼 벗어나야 출발한다. 팔길이 배수 단위다.
     #
-    # 주행은 고정속도(on-off)라 데드존을 벗어나는 순간 곧바로 BASE_SPEED
-    # 전부가 나간다. 그래서 이 값은 '얼마나 빨리 가나'가 아니라
-    # '손을 얼마나 움직여야 출발하나'를 정한다.
+    # 주행은 고정속도(on-off)라 데드존을 넘는 순간 BASE_SPEED 전부가 나간다.
+    # 그래서 이 값은 '얼마나 빠른가'가 아니라 '얼마나 움직여야 출발하나'다.
     #
-    # 손 이동거리로 환산 (팔길이 38.9cm, up_span 0.414 기준):
-    #       r     전진(위)   후진(아래)   좌우
-    #     0.30      4.8cm      2.9cm     5.8cm   ← 예전 값. 너무 예민했다
-    #     0.60      9.7cm      5.8cm    11.7cm   ← 현재
-    #     0.90     14.5cm      8.7cm    17.5cm
-    # 환산식:  거리(cm) = r × 축스팬 × CAL_ARM_LEN × 100
-    #   축스팬 — 전진 up_span / 후진 up_span×BASE_DOWN_SPAN_SCALE / 좌우 BASE_LAT_SPAN
+    # 이제 모든 방향에서 같은 거리다(예전에는 축마다 3배까지 차이 났다):
+    #     거리(cm) = BASE_DEADZONE × CAL_ARM_LEN × 100
     #
-    # 후진이 전진보다 예민한 것은 BASE_DOWN_SPAN_SCALE(0.60) 때문이다.
-    # 사람의 아래쪽 가동범위가 좁아서 작은 스팬으로 나눈 것인데, 고정속도
-    # 방식에서는 그냥 후진만 더 민감해지는 결과가 된다. 좌우까지 균일하게
-    # 맞추고 싶으면 이 값을 1.0 으로.
-    BASE_DEADZONE      = 0.60
+    #       값     팔길이 38.9cm 기준
+    #     0.15         5.8cm
+    #     0.20         7.8cm
+    #     0.25         9.7cm    ← 현재
+    #     0.30        11.7cm
+    BASE_DEADZONE      = 0.25
     BASE_SATURATION    = 0.90    # (온오프 방식에서는 크기 판정에 쓰이지 않음)
     BASE_EXPO          = 1.2     # (미사용 — 되돌릴 때를 위해 남겨둠)
     V_MIN_CMD          = 0.10    # (미사용)
@@ -2606,17 +2601,27 @@ class MirobotAiNode(Node):
         # 반드시 베이스팔 자신의 값이어야 한다. 제어팔 중립을 쓰면 팔을
         # 내린 정지 자세가 '최대 후진'으로 읽혀 가만히 있어도 뒤로 달린다.
         lat_ref, up_ref = self._drive_neutral_ref()
-        up_span = max(self.CAL_UP_MAX - self.CAL_UP_NEUTRAL, 0.10)
-        d_up = norm_up - up_ref
-        if d_up >= 0.0:
-            jy = d_up / up_span
-        else:
-            jy = d_up / max(up_span * self.BASE_DOWN_SPAN_SCALE, 0.10)
 
-        # ── 좌우 ──────────────────────────────────────────────────────────
-        jx = (norm_lat - lat_ref) / max(self.BASE_LAT_SPAN, 1e-6)
+        # ── 중립 기준 손 변위 ─────────────────────────────────────────────
+        # norm_lat 과 norm_up 은 둘 다 (손목-어깨)/팔길이 성분이라 단위가 같다.
+        # 그래서 이 둘은 그대로 물리적인 2D 변위 벡터로 쓸 수 있고, 크기에
+        # CAL_ARM_LEN 을 곱하면 실제 이동거리(m)가 된다.
+        #
+        # [수정] 예전에는 축마다 다른 스팬(up_span / BASE_LAT_SPAN)으로 나눈
+        # 뒤 그 값으로 atan2 를 했다. 그러면 각도가 스팬 비율만큼 왜곡된다.
+        # 좌우 스팬을 실측(0.745)하면서 비율이 1.2 → 1.8 로 커졌고, 물리적
+        # 45° 대각선이 29° 로 계산되어 '전진' 섹터로 잡히는 문제가 드러났다.
+        # "8섹터 스냅이라 각도 왜곡은 무관하다"던 원래 주석은 틀렸다 —
+        # 섹터를 고르는 것이 바로 그 왜곡된 각도이기 때문이다.
+        #
+        # 스팬 정규화는 원래 비례 제어를 위한 것이었는데 고정속도로 바꾸면서
+        # 쓸 이유가 없어졌다. 방향도 크기도 실제 변위로 낸다. 부수적으로
+        # 축마다 3배씩 달랐던 데드존 거리(전진 9.7 / 후진 5.8 / 좌우 17.4cm)가
+        # 모든 방향에서 같아진다.
+        d_lat = norm_lat - lat_ref
+        d_up  = norm_up  - up_ref
 
-        r = math.hypot(jx, jy)
+        r = math.hypot(d_lat, d_up)
 
         # ── 데드존 ────────────────────────────────────────────────────────
         # 램프를 거치지 않고 즉시 0 으로 떨어뜨린다. 손을 중립으로 되돌리는
@@ -2627,9 +2632,10 @@ class MirobotAiNode(Node):
             return (0.0, 0.0)
 
         # ── 방향: 8섹터 스냅 ──────────────────────────────────────────────
-        # jy 가 +면 위(전진), jx 가 +면 화면 왼쪽(= 로봇 좌측, SIGN_LAT 기준).
-        # atan2(jx, jy) 로 재면 0°가 전진, +90°가 좌측이 된다.
-        theta = math.degrees(math.atan2(jx, jy))
+        # d_up 이 +면 위(전진), d_lat 이 +면 화면 왼쪽(= 로봇 좌측, SIGN_LAT).
+        # atan2(d_lat, d_up) 로 재면 0°가 전진, +90°가 좌측이 된다.
+        # 실제 손 변위를 그대로 쓰므로 물리적 방향과 계산 각도가 일치한다.
+        theta = math.degrees(math.atan2(d_lat, d_up))
         self.base_sector = self._snap_sector(theta, self.base_sector)
         a = math.radians(self.base_sector * self.BASE_SECTOR_DEG)
 
@@ -2654,8 +2660,10 @@ class MirobotAiNode(Node):
                 _sec = ['전진', '전좌', '좌', '후좌', '후진', '후우', '우', '전우']
                 self.get_logger().info(
                     f"[베이스] up {norm_up:+.3f} (주행중립{up_ref:+.3f}) "
-                    f"lat {norm_lat:+.3f} → jx {jx:+.2f} jy {jy:+.2f} "
-                    f"r {r:.2f}/데드존{self.BASE_DEADZONE} | 섹터 {_sec[self.base_sector]} "
+                    f"lat {norm_lat:+.3f} → 변위 Δlat {d_lat:+.3f} Δup {d_up:+.3f} "
+                    f"r {r:.3f}/데드존{self.BASE_DEADZONE} "
+                    f"({r * max(self.CAL_ARM_LEN, 0.30) * 100:.1f}cm) "
+                    f"| 섹터 {_sec[self.base_sector]} "
                     f"| s_raw {s_raw:.2f} ramp {self.base_s_ramp:.2f} "
                     f"| vx {vx:+.3f} vy {vy:+.3f}"
                     f"{('  ※차단: ' + self.base_block_why) if self.base_block_why else '  ▶발행중'}")
