@@ -855,7 +855,25 @@ class MirobotAiNode(Node):
     # ─────────── 베이스 조작 상수 ───────────
     # 값의 근거는 실측이다. 전진/좌우 각각 7단계 속도로 오도메트리를 재서
     # 얻은 결과이며, 임의로 바꾸면 조작감이 무너진다.
-    BASE_DEADZONE      = 0.30    # 정규화 반경, 이하는 정지
+    # 정규화 반경. 이하는 정지.
+    #
+    # 주행은 고정속도(on-off)라 데드존을 벗어나는 순간 곧바로 BASE_SPEED
+    # 전부가 나간다. 그래서 이 값은 '얼마나 빨리 가나'가 아니라
+    # '손을 얼마나 움직여야 출발하나'를 정한다.
+    #
+    # 손 이동거리로 환산 (팔길이 38.9cm, up_span 0.414 기준):
+    #       r     전진(위)   후진(아래)   좌우
+    #     0.30      4.8cm      2.9cm     5.8cm   ← 예전 값. 너무 예민했다
+    #     0.60      9.7cm      5.8cm    11.7cm   ← 현재
+    #     0.90     14.5cm      8.7cm    17.5cm
+    # 환산식:  거리(cm) = r × 축스팬 × CAL_ARM_LEN × 100
+    #   축스팬 — 전진 up_span / 후진 up_span×BASE_DOWN_SPAN_SCALE / 좌우 BASE_LAT_SPAN
+    #
+    # 후진이 전진보다 예민한 것은 BASE_DOWN_SPAN_SCALE(0.60) 때문이다.
+    # 사람의 아래쪽 가동범위가 좁아서 작은 스팬으로 나눈 것인데, 고정속도
+    # 방식에서는 그냥 후진만 더 민감해지는 결과가 된다. 좌우까지 균일하게
+    # 맞추고 싶으면 이 값을 1.0 으로.
+    BASE_DEADZONE      = 0.60
     BASE_SATURATION    = 0.90    # (온오프 방식에서는 크기 판정에 쓰이지 않음)
     BASE_EXPO          = 1.2     # (미사용 — 되돌릴 때를 위해 남겨둠)
     V_MIN_CMD          = 0.10    # (미사용)
@@ -892,7 +910,10 @@ class MirobotAiNode(Node):
     #   후진(아래)과 좌우는 캘리브레이션 단계가 없으므로 배율/상수로 추정한다.
     #   축마다 다른 스팬으로 나누면 8방향이 모두 같은 팔 변위로 최대 속도에
     #   도달한다. 각도가 물리적으로는 왜곡되지만 8섹터 스냅을 쓰므로 무관하다.
-    BASE_LAT_SPAN        = 0.50   # 팔을 옆으로 최대한 벌렸을 때의 norm_lat (실측 ±0.55)
+    # 팔을 옆으로 최대한 벌렸을 때의 norm_lat 폭. 캘리브레이션 4단계에서
+    # 실측해 덮어쓴다. 아래 값은 측정 전 폴백일 뿐이다.
+    BASE_LAT_SPAN        = 0.50
+    CAL_LAT_MAX          = 0.0    # 0 이면 미측정
     BASE_DOWN_SPAN_SCALE = 0.60   # 후진 가동범위 = up_span * 이 값
 
     # ── 모드 전환: 손 중립 유지 ──────────────────────────────────────────
@@ -915,7 +936,20 @@ class MirobotAiNode(Node):
     # 느슨해 보이지만 오전환 위험은 낮다. 팔을 내린 쉬는 자세의 r 은 5~7 로
     # 한참 밖이고, 반대 손이 중립이 아니어야 한다는 조건과 2.5초 유지가
     # 그대로 남아 있다.
-    MODE_NEUTRAL_TOL         = 0.60   # 이 아래로 들어오면 '중립' 진입
+    # ── 임계 자동 산출 ──────────────────────────────────────────────
+    # 아래 두 임계는 r 에 대한 절대값이라, 포즈 추정이 얼마나 흔들리는지에
+    # 따라 적정값이 달라진다. 그 흔들림은 카메라·거리·조명·체형마다 다르므로
+    # 고정값을 박아두면 다른 기기에서 반드시 어긋난다.
+    #
+    # 그래서 캘리브레이션 1단계(정자세로 2초 유지)의 샘플로 'r 이 실제로
+    # 얼마나 흔들리는가'를 재서 그 배수로 정한다. 조작자가 자세를 다시
+    # 만들 때는 유지할 때보다 부정확하므로 배수를 넉넉히 둔다.
+    MODE_TOL_K          = 2.5    # 관측 흔들림(p90) 대비 배수
+    MODE_TOL_MIN        = 0.35   # 너무 빡빡해지지 않도록
+    MODE_TOL_MAX        = 1.20   # 너무 느슨해지지 않도록
+    MODE_TOL_EXIT_RATIO = 1.4    # 해제임계 = 진입임계 × 이 값 (슈미트 트리거)
+
+    MODE_NEUTRAL_TOL         = 0.60   # 이 아래로 들어오면 '중립' 진입 (미측정 시 폴백)
     # 나가는 임계를 따로 둔다(슈미트 트리거). 하나의 임계로는 경계에서
     # 반드시 채터링이 나고, 여기서는 그게 곧 타이머 리셋이라 치명적이다.
     MODE_NEUTRAL_TOL_EXIT    = 0.85   # 이 위로 나가야 '중립' 해제
@@ -964,19 +998,24 @@ class MirobotAiNode(Node):
     CALIB_STATUS_PUB_INTERVAL = 0.2
     CALIB_PREP_DELAY_SEC = 3.0
 
-    CALIB_STAGES = ['neutral', 'reach_forward', 'reach_up',
+    CALIB_STAGES = ['neutral', 'reach_forward', 'reach_up', 'reach_side',
                     'wrist_straight', 'wrist_back', 'wrist_front']
     CALIB_INSTRUCTIONS = {
-        'neutral':        "1/6 단계: 팔꿈치를 편하게 굽혀 몸 앞쪽에 손을 두는 '기본 자세'를 유지하세요. "
+        'neutral':        "1/7 단계: 팔꿈치를 편하게 굽혀 몸 앞쪽에 손을 두는 '기본 자세'를 유지하세요. "
                           "(이 위치가 로봇의 기준 위치가 됩니다)",
-        'reach_forward':  "2/6 단계: 팔을 카메라 쪽으로 최대한 앞으로 뻗은 자세를 유지하세요.",
-        'reach_up':       "3/6 단계: 팔을 최대한 위로 들어올린 자세를 유지하세요.",
+        'reach_forward':  "2/7 단계: 팔을 카메라 쪽으로 최대한 앞으로 뻗은 자세를 유지하세요.",
+        'reach_up':       "3/7 단계: 팔을 최대한 위로 들어올린 자세를 유지하세요.",
+        # 좌우 가동폭. 예전에는 BASE_LAT_SPAN=0.50 으로 박아뒀는데, 재본 적
+        # 없는 추측치라 사람·카메라가 바뀌면 그대로 어긋났다. 게다가 모드
+        # 판정의 r 은 이 축이 지배하는 경우가 많아 영향이 크다.
+        'reach_side':     "4/7 단계: 팔을 옆으로 최대한 벌린 자세를 유지하세요. "
+                          "(어깨 높이까지 올리지 말고 옆으로만 벌리세요)",
         # [중요] 손목 굴곡은 2D 화면 투영이라 팔의 위치에 따라 카메라에 보이는
         # 민감도가 달라짐 — 실제 조작 시의 자세(보통 몸 앞으로 내린 자세)와 다른
         # 자세에서 캘리브레이션하면 정작 그 자세에서 반응이 둔해짐.
-        'wrist_straight': "4/6 단계: 팔을 몸 앞쪽에 편하게 둔 자세를 유지한 채, 손목만 전완과 일직선이 되도록 곧게 펴세요.",
-        'wrist_back':     "5/6 단계: 팔은 그대로, 손등을 팔꿈치 쪽으로 최대한 꺾으세요. (그리퍼가 정면 수평을 향하게 됩니다)",
-        'wrist_front':    "6/6 단계: 팔은 그대로, 손목만 안쪽으로 최대한 꺾으세요. (그리퍼가 수직 아래를 향하게 됩니다)",
+        'wrist_straight': "5/7 단계: 팔을 몸 앞쪽에 편하게 둔 자세를 유지한 채, 손목만 전완과 일직선이 되도록 곧게 펴세요.",
+        'wrist_back':     "6/7 단계: 팔은 그대로, 손등을 팔꿈치 쪽으로 최대한 꺾으세요. (그리퍼가 정면 수평을 향하게 됩니다)",
+        'wrist_front':    "7/7 단계: 팔은 그대로, 손목만 안쪽으로 최대한 꺾으세요. (그리퍼가 수직 아래를 향하게 됩니다)",
     }
 
     # ── 미니멀 카메라 UI 스타일 (v1 그대로) ───────────────────────────────
@@ -1103,6 +1142,13 @@ class MirobotAiNode(Node):
         self.calib_mode = None
         self.calib_session_active = False
         self.calib_next_stage_idx = 0
+        self.CAL_LAT_MAX          = MirobotAiNode.CAL_LAT_MAX
+        self.BASE_LAT_SPAN        = MirobotAiNode.BASE_LAT_SPAN
+        self.MODE_NEUTRAL_TOL      = MirobotAiNode.MODE_NEUTRAL_TOL
+        self.MODE_NEUTRAL_TOL_EXIT = MirobotAiNode.MODE_NEUTRAL_TOL_EXIT
+        # 1단계 샘플 원본. 임계 자동 산출은 CAL_UP_MAX 와 BASE_LAT_SPAN 이
+        # 모두 정해진 뒤(4단계 끝)에야 계산할 수 있어 여기 따로 보관한다.
+        self.calib_neutral_snap = []
         self.calib_samples_pos   = []   # (fwd, lat, up) 정규화 좌표 샘플
         self.calib_samples_base  = []   # 베이스팔 (lat, up) — 중립 단계에서만
         self.calib_samples_arm   = []   # 팔 길이 샘플(m) — 중립 단계에서만 사용
@@ -1902,6 +1948,13 @@ class MirobotAiNode(Node):
         self.calib_mode = None
         self.calib_session_active = False
         self.calib_next_stage_idx = 0
+        self.CAL_LAT_MAX          = MirobotAiNode.CAL_LAT_MAX
+        self.BASE_LAT_SPAN        = MirobotAiNode.BASE_LAT_SPAN
+        self.MODE_NEUTRAL_TOL      = MirobotAiNode.MODE_NEUTRAL_TOL
+        self.MODE_NEUTRAL_TOL_EXIT = MirobotAiNode.MODE_NEUTRAL_TOL_EXIT
+        # 1단계 샘플 원본. 임계 자동 산출은 CAL_UP_MAX 와 BASE_LAT_SPAN 이
+        # 모두 정해진 뒤(4단계 끝)에야 계산할 수 있어 여기 따로 보관한다.
+        self.calib_neutral_snap = []
         self.calib_samples_pos = []
         self.calib_samples_arm = []
         self.calib_samples_j6 = []
@@ -2602,7 +2655,7 @@ class MirobotAiNode(Node):
                 self.get_logger().info(
                     f"[베이스] up {norm_up:+.3f} (주행중립{up_ref:+.3f}) "
                     f"lat {norm_lat:+.3f} → jx {jx:+.2f} jy {jy:+.2f} "
-                    f"r {r:.2f} | 섹터 {_sec[self.base_sector]} "
+                    f"r {r:.2f}/데드존{self.BASE_DEADZONE} | 섹터 {_sec[self.base_sector]} "
                     f"| s_raw {s_raw:.2f} ramp {self.base_s_ramp:.2f} "
                     f"| vx {vx:+.3f} vy {vy:+.3f}"
                     f"{('  ※차단: ' + self.base_block_why) if self.base_block_why else '  ▶발행중'}")
@@ -3062,7 +3115,7 @@ class MirobotAiNode(Node):
             text = f"{instr}  [자세 잡는 중... {remaining:.1f}초 후 측정 시작]"
         else:
             instr = self.CALIB_INSTRUCTIONS[self.calib_mode]
-            if self.calib_mode in ('neutral', 'reach_forward', 'reach_up'):
+            if self.calib_mode in ('neutral', 'reach_forward', 'reach_up', 'reach_side'):
                 count = len(self.calib_samples_pos)
             else:
                 count = len(self.calib_samples_wrist)
@@ -3087,6 +3140,51 @@ class MirobotAiNode(Node):
             override_text=(f"캘리브레이션 실패: {reason}\n"
                            f"준비되면 '이 단계 재시도' 버튼을 눌러 다시 시도하세요."))
 
+    def _derive_mode_tolerance(self):
+        """1단계 샘플의 흔들림으로 모드 전환 임계를 정한다.
+
+        [왜 고정값이면 안 되나]
+        MODE_NEUTRAL_TOL 은 r 에 대한 절대 임계인데, r 이 얼마나 흔들리는지는
+        카메라 화질·거리·조명·체형마다 다르다. 한 기기에서 맞춘 값은 다른
+        기기에서 너무 빡빡하거나(전환이 안 걸림) 너무 느슨해진다(양손이 다
+        중립으로 잡혀 역시 안 걸림). 실제로 이 프로젝트에서 두 증상을 다 겪었다.
+
+        [무엇을 재는가]
+        1단계는 조작자가 '정자세를 2초간 유지' 하는 구간이다. 그 샘플들의 r 은
+        이상적으로는 전부 0 이어야 한다. 0 이 아닌 만큼이 곧 이 설치 환경의
+        잡음이다. 그래서 그 값을 임계의 기준으로 쓴다.
+
+        p90 을 쓰는 이유는 자세를 잡는 과도기 몇 프레임이 크게 튀기 때문이다.
+        배수(MODE_TOL_K)를 두는 이유는, 나중에 자세를 '다시 만들' 때는 계속
+        '유지' 할 때보다 부정확하기 때문이다. 하한·상한으로 극단값을 막는다.
+        """
+        snap = self.calib_neutral_snap
+        if len(snap) < 10:
+            self.get_logger().warn(
+                f"[캘리브레이션] 1단계 샘플이 부족해({len(snap)}개) 전환 임계를 "
+                f"자동 산출하지 못했습니다 — 기본값 "
+                f"{self.MODE_NEUTRAL_TOL:.2f}/{self.MODE_NEUTRAL_TOL_EXIT:.2f} 유지")
+            return
+
+        ctrl = self.control_arm
+        rs = sorted(self._joystick_radius(lat, up, ctrl) for (_f, lat, up) in snap)
+        p90 = rs[min(int(len(rs) * 0.9), len(rs) - 1)]
+
+        tol = max(self.MODE_TOL_MIN, min(self.MODE_TOL_MAX, self.MODE_TOL_K * p90))
+        self.MODE_NEUTRAL_TOL = tol
+        self.MODE_NEUTRAL_TOL_EXIT = tol * self.MODE_TOL_EXIT_RATIO
+
+        clamped = ''
+        if tol >= self.MODE_TOL_MAX - 1e-9:
+            clamped = ' [상한에 걸림 — 자세가 많이 흔들렸다는 뜻]'
+        elif tol <= self.MODE_TOL_MIN + 1e-9:
+            clamped = ' [하한에 걸림 — 매우 안정적인 환경]'
+        self.get_logger().info(
+            f"[캘리브레이션] 전환 임계 자동 산출: 정자세 흔들림 r "
+            f"중앙값 {rs[len(rs) // 2]:.3f} / p90 {p90:.3f} (샘플 {len(rs)}개) "
+            f"→ 진입 {self.MODE_NEUTRAL_TOL:.2f} / 해제 "
+            f"{self.MODE_NEUTRAL_TOL_EXIT:.2f}{clamped}")
+
     def _finish_calib_stage(self):
         """현재 단계의 샘플을 평균 내어 반영하고, 다음 단계는 자동으로 넘어가지 않고
         사용자가 버튼을 다시 누를 때까지 대기함 (자세를 바꿀 시간을 주기 위함)."""
@@ -3096,7 +3194,7 @@ class MirobotAiNode(Node):
         # ── 1~3단계: 사람 팔의 실제 이동 범위 측정 ────────────────────────
         # v1은 여기서 어깨각/팔꿈치각을 쟀지만, v2는 관절각 매핑을 쓰지 않으므로
         # 대신 "정규화된 손목 위치"의 기준점과 최대치를 잰다.
-        if stage in ('neutral', 'reach_forward', 'reach_up'):
+        if stage in ('neutral', 'reach_forward', 'reach_up', 'reach_side'):
             n = len(self.calib_samples_pos)
             avg_fwd = sum(s[0] for s in self.calib_samples_pos) / n
             avg_lat = sum(s[1] for s in self.calib_samples_pos) / n
@@ -3180,6 +3278,9 @@ class MirobotAiNode(Node):
                         f"베이스 조작이 어긋나면 양팔이 모두 화면에 들어오도록 "
                         f"카메라를 조정하고 다시 캘리브레이션하세요.")
 
+                # 임계 자동 산출용 원본 보관 (4단계에서 씀)
+                self.calib_neutral_snap = list(self.calib_samples_pos)
+
                 self.get_logger().info(
                     f"[캘리브레이션] 중립 fwd={avg_fwd:.3f} lat={avg_lat:.3f} up={avg_up:.3f}")
 
@@ -3202,6 +3303,24 @@ class MirobotAiNode(Node):
                                      "들어올린 높이가 기본 자세와 거의 같습니다. "
                                      "팔을 더 높이 들어주세요.")
                     return
+
+            elif stage == 'reach_side':
+                # 좌우 폭. 중립에서 얼마나 벌어졌는지의 '절대값'이 스팬이다.
+                # 부호는 어느 팔이냐에 따라 달라지므로 여기서 없앤다.
+                span = abs(avg_lat - self.CAL_LAT_NEUTRAL)
+                self.get_logger().info(
+                    f"[캘리브레이션] 최대 측방 lat={avg_lat:.3f} → 좌우 스팬 "
+                    f"{span:.3f} (예전 고정값 {MirobotAiNode.BASE_LAT_SPAN})")
+                if span < self.CALIB_MIN_RANGE_NORM:
+                    self._calib_fail(current_idx,
+                                     "옆으로 벌린 정도가 기본 자세와 거의 같습니다. "
+                                     "팔을 몸에서 더 확실히 떼어주세요.")
+                    return
+                self.CAL_LAT_MAX = avg_lat
+                self.BASE_LAT_SPAN = span
+                # 여기까지 와야 up_span 과 좌우 스팬이 모두 정해진다.
+                # 그제서야 1단계 샘플의 r 을 계산할 수 있다.
+                self._derive_mode_tolerance()
 
         # ── 4~6단계: 손목 3점 (v1과 동일한 절차) ──────────────────────────
         elif stage == 'wrist_straight':
@@ -3770,7 +3889,7 @@ class MirobotAiNode(Node):
             # ── 캘리브레이션 샘플 수집 (1~3단계: 위치) ──────────────────────
             # AI ON/OFF와 무관하게 수집. 단, 버튼을 누른 직후 준비 시간 동안은
             # 자세를 잡는 과도기라 샘플을 모으지 않음.
-            if (pos_valid and self.calib_mode in ('neutral', 'reach_forward', 'reach_up')
+            if (pos_valid and self.calib_mode in ('neutral', 'reach_forward', 'reach_up', 'reach_side')
                     and current_time >= self.calib_prep_until):
                 self.calib_samples_pos.append((norm_fwd, norm_lat, norm_up))
                 # 팔 길이는 중립 자세에서만 모은다. 뻗거나 들어올린 자세는
