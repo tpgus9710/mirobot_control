@@ -320,6 +320,19 @@ class MirobotAiNode(Node):
     CAL_UP_MAX      = 0.60
     CAL_LAT_NEUTRAL = 0.0
 
+    # 베이스팔(반대쪽 팔)의 중립. 제어팔 값을 그대로 쓰면 안 된다 —
+    # 제어팔의 중립은 캘리브레이션이 지시하는 '몸 앞쪽에 손을 둔' 자세이고,
+    # 베이스팔의 중립은 '주행을 안 하고 내려둔' 자세라 상하 위치가 전혀 다르다.
+    # 좌우는 거울상이지만 상하는 거울상이 아니다.
+    # 기본값은 팔을 자연스럽게 내렸을 때의 실측 대략치이며,
+    # 캘리브레이션 중립 단계에서 반대쪽 팔을 같이 재서 덮어쓴다.
+    CAL_BASE_UP_NEUTRAL  = -0.70
+    CAL_BASE_LAT_NEUTRAL =  0.0
+    # 위 두 값이 '실측된 것인지'. 기본값은 사람·카메라 위치에 따라 쉽게
+    # 0.2 이상 어긋나고, 그 오차는 정지 자세에서 그대로 주행 명령이 된다.
+    # 측정 전에는 베이스 모드 진입을 막는다.
+    CAL_BASE_SET = False
+
     # 위 사람 쪽 기준점들이 대응되는 로봇 좌표 (mm)
     # [주의] 위의 WS_*_MM(작업공간 한계)과 헷갈리지 않도록 MAP_ 접두사를 씀.
     #        이 네 점은 모두 도달 가능 영역 안에 있어야 함(전수검사로 확인 완료).
@@ -889,6 +902,23 @@ class MirobotAiNode(Node):
     # '그 손이 중립' 은 곧 '그 모드에서 정지' 이므로, 전환 신호와 정지
     # 상태가 자연스럽게 대응한다. 전환 순간 해당 팔이 중립이라는 점이
     # 급이동을 원천적으로 막아준다.
+    # 전환 트리거의 중립 허용 오차. 주행 데드존(BASE_DEADZONE)과 값은 같게
+    # 시작하지만 목적이 달라 따로 둔다 — 이건 '캘리브 자세를 얼마나 정확히
+    # 재현해야 하는가' 이고, 저건 '얼마나 움직여야 주행을 시작하는가' 다.
+    # 자세 재현이 빡빡해서 전환이 잘 안 걸리면 이 값만 키우면 된다.
+    # 실측 근거: 조작자가 자세를 잘 잡았을 때 r 이 0.28~0.48 사이를 오갔다.
+    # r 을 키우는 것은 up 이 아니라 lat 이다. lat 기준값이 제어팔을 부호만
+    # 뒤집은 추정치인 데다, 실측 lat 자체가 프레임마다 ±0.2 흔들리는데
+    # BASE_LAT_SPAN(0.50)으로 나누니 ±0.4 로 증폭된다. 0.30 은 그 잡음보다
+    # 작아서 임계를 계속 넘나들었고, 그때마다 2.5초 누적이 0 으로 지워졌다.
+    #
+    # 느슨해 보이지만 오전환 위험은 낮다. 팔을 내린 쉬는 자세의 r 은 5~7 로
+    # 한참 밖이고, 반대 손이 중립이 아니어야 한다는 조건과 2.5초 유지가
+    # 그대로 남아 있다.
+    MODE_NEUTRAL_TOL         = 0.60   # 이 아래로 들어오면 '중립' 진입
+    # 나가는 임계를 따로 둔다(슈미트 트리거). 하나의 임계로는 경계에서
+    # 반드시 채터링이 나고, 여기서는 그게 곧 타이머 리셋이라 치명적이다.
+    MODE_NEUTRAL_TOL_EXIT    = 0.85   # 이 위로 나가야 '중립' 해제
     MODE_NEUTRAL_HOLD_SEC    = 2.5    # 이만큼 중립을 유지해야 전환
     MODE_COOLDOWN_SEC        = 2.0    # 전환 직후 재전환 금지 시간
     MODE_TRANSITION_LOCK_SEC = 1.0    # 전환 직후 양쪽 모두 발행 금지
@@ -987,6 +1017,15 @@ class MirobotAiNode(Node):
         self.mode_cooldown_until = 0.0
         self.mode_lock_until = 0.0
         self.mode_dbg_t = 0.0
+        # [진단] 모드 판정이 이른 return 으로 빠질 때 그 사유를 찍기 위한 타이머.
+        # 판정 로그는 return 뒤에 있어서, 안 찍히는 것만으로는 어디서 빠졌는지
+        # 알 수 없다. 사유를 직접 남긴다.
+        self.mode_block_dbg_t = 0.0
+        self.mode_block_dbg_last = ''
+        # [진단] _arm_norm 이 None 을 낸 마지막 사유. 팔별로 따로 둔다.
+        self._arm_norm_fail = {}
+        # 팔별 중립 래치. 진입/이탈 임계가 달라 직전 상태를 기억해야 한다.
+        self._neutral_latch = {}
 
         # [상태 변수] 베이스 조작. 전부 _hard_reset_control_state() 에 등록됨.
         #   base_last_cmd  ★ 가장 위험 — 낡은 속도가 남아 재발행되면 로봇이 굴러간다
@@ -1054,6 +1093,9 @@ class MirobotAiNode(Node):
         self.CAL_UP_NEUTRAL  = MirobotAiNode.CAL_UP_NEUTRAL
         self.CAL_UP_MAX      = MirobotAiNode.CAL_UP_MAX
         self.CAL_LAT_NEUTRAL = MirobotAiNode.CAL_LAT_NEUTRAL
+        self.CAL_BASE_UP_NEUTRAL  = MirobotAiNode.CAL_BASE_UP_NEUTRAL
+        self.CAL_BASE_LAT_NEUTRAL = MirobotAiNode.CAL_BASE_LAT_NEUTRAL
+        self.CAL_BASE_SET         = MirobotAiNode.CAL_BASE_SET
         self.WRIST_ANGLE_STRAIGHT = MirobotAiNode.WRIST_ANGLE_STRAIGHT
         self.WRIST_ANGLE_BACK     = MirobotAiNode.WRIST_ANGLE_BACK
         self.WRIST_ANGLE_FRONT    = MirobotAiNode.WRIST_ANGLE_FRONT
@@ -1062,6 +1104,7 @@ class MirobotAiNode(Node):
         self.calib_session_active = False
         self.calib_next_stage_idx = 0
         self.calib_samples_pos   = []   # (fwd, lat, up) 정규화 좌표 샘플
+        self.calib_samples_base  = []   # 베이스팔 (lat, up) — 중립 단계에서만
         self.calib_samples_arm   = []   # 팔 길이 샘플(m) — 중립 단계에서만 사용
         self.calib_samples_j6    = []   # J6 기준 롤 샘플(도) — 중립 단계에서만 사용
 
@@ -1453,12 +1496,17 @@ class MirobotAiNode(Node):
                 arr = np.frombuffer(message, dtype=np.uint8)
                 decoded = cv2.imdecode(arr, cv2.IMREAD_COLOR)
                 if decoded is not None:
-                    # [진단] 폰이 실제로 보내는 원본 해상도를 1초에 한 번만 찍음.
+                    # [진단] 폰이 실제로 보내는 원본 해상도.
                     # 여기 로그의 w×h가 예: 480×640(세로)이면 크롭이 동작해야 정상,
                     # 640×480(가로)이면 폰이 이미 가로로 보내는 것이라 크롭할 게 없음.
-                    now_dbg = time.time()
-                    if now_dbg - getattr(self, '_last_src_log', 0) > 1.0:
-                        self._last_src_log = now_dbg
+                    #
+                    # [수정] 1초 주기로 찍었더니 해상도가 안 바뀌는 동안에도
+                    # 로그를 가득 채워서 [모드판정] 같은 진짜 진단이 묻혔다.
+                    # 알고 싶은 것은 '값' 이 아니라 '값이 무엇으로 바뀌었나' 이므로
+                    # 바뀔 때만 찍는다.
+                    _src_wh = (decoded.shape[1], decoded.shape[0])
+                    if _src_wh != getattr(self, '_last_src_wh', None):
+                        self._last_src_wh = _src_wh
                         self.get_logger().info(
                             f"[진단] 업로드된 원본 프레임 해상도: "
                             f"{decoded.shape[1]}x{decoded.shape[0]} "
@@ -1778,6 +1826,11 @@ class MirobotAiNode(Node):
                 self.get_logger().info("[모드] 호밍 감지 — ARM 모드로 되돌립니다.")
             self.mode = 'arm'
             self.mode_hold_since = 0.0
+            # [버그] mode_hold_target 을 안 비우면, 다음 판정에서
+            # mode_hold_target == target 이 되어 mode_hold_since = now 를
+            # 건너뛴다. mode_hold_since 는 0 이라 (now - 0) >= 2.5 가 항상
+            # 참이 되어, 2.5초 유지 없이 첫 프레임에 바로 전환된다.
+            self.mode_hold_target = None
             self.mode_cooldown_until = 0.0
             self.mode_lock_until = 0.0
             self._publish_mode()
@@ -1839,6 +1892,9 @@ class MirobotAiNode(Node):
         self.CAL_UP_NEUTRAL  = MirobotAiNode.CAL_UP_NEUTRAL
         self.CAL_UP_MAX      = MirobotAiNode.CAL_UP_MAX
         self.CAL_LAT_NEUTRAL = MirobotAiNode.CAL_LAT_NEUTRAL
+        self.CAL_BASE_UP_NEUTRAL  = MirobotAiNode.CAL_BASE_UP_NEUTRAL
+        self.CAL_BASE_LAT_NEUTRAL = MirobotAiNode.CAL_BASE_LAT_NEUTRAL
+        self.CAL_BASE_SET         = MirobotAiNode.CAL_BASE_SET
         self.WRIST_ANGLE_STRAIGHT = MirobotAiNode.WRIST_ANGLE_STRAIGHT
         self.WRIST_ANGLE_BACK     = MirobotAiNode.WRIST_ANGLE_BACK
         self.WRIST_ANGLE_FRONT    = MirobotAiNode.WRIST_ANGLE_FRONT
@@ -1849,6 +1905,7 @@ class MirobotAiNode(Node):
         self.calib_samples_pos = []
         self.calib_samples_arm = []
         self.calib_samples_j6 = []
+        self.calib_samples_base = []
         self.calib_samples_wrist = []
         self.calib_prep_until = 0.0
 
@@ -1869,6 +1926,7 @@ class MirobotAiNode(Node):
                 self.calib_samples_pos = []
                 self.calib_samples_arm = []
                 self.calib_samples_j6 = []
+                self.calib_samples_base = []
                 self.calib_samples_wrist = []
                 # 버튼을 누른 직후는 아직 자세를 잡는 중이므로, 이 시각까지는
                 # 샘플을 모으지 않고 "준비 시간"으로만 사용함.
@@ -2491,18 +2549,19 @@ class MirobotAiNode(Node):
         1e-17 이 남으면 이 조건이 영영 안 걸려 적분항이 계속 누적된다.
         """
         # ── 전후: 중립 기준, 위/아래 게인 분리 ────────────────────────────
+        # 스팬은 제어팔에서 잰 것을 쓰되(가동폭은 양팔이 비슷하다), 중립은
+        # 반드시 베이스팔 자신의 값이어야 한다. 제어팔 중립을 쓰면 팔을
+        # 내린 정지 자세가 '최대 후진'으로 읽혀 가만히 있어도 뒤로 달린다.
+        lat_ref, up_ref = self._drive_neutral_ref()
         up_span = max(self.CAL_UP_MAX - self.CAL_UP_NEUTRAL, 0.10)
-        d_up = norm_up - self.CAL_UP_NEUTRAL
+        d_up = norm_up - up_ref
         if d_up >= 0.0:
             jy = d_up / up_span
         else:
             jy = d_up / max(up_span * self.BASE_DOWN_SPAN_SCALE, 0.10)
 
         # ── 좌우 ──────────────────────────────────────────────────────────
-        # 베이스를 맡는 팔의 좌우 중립. 캘리브레이션은 제어팔에서만 재므로
-        # 반대쪽 팔에는 거울상으로 부호를 뒤집은 값을 쓴다.
-        jx = ((norm_lat - self._lat_neutral_for(self.base_arm()))
-              / max(self.BASE_LAT_SPAN, 1e-6))
+        jx = (norm_lat - lat_ref) / max(self.BASE_LAT_SPAN, 1e-6)
 
         r = math.hypot(jx, jy)
 
@@ -2541,7 +2600,7 @@ class MirobotAiNode(Node):
                 self._base_dbg_t = _t
                 _sec = ['전진', '전좌', '좌', '후좌', '후진', '후우', '우', '전우']
                 self.get_logger().info(
-                    f"[베이스] up {norm_up:+.3f} (중립{self.CAL_UP_NEUTRAL:+.3f}) "
+                    f"[베이스] up {norm_up:+.3f} (주행중립{up_ref:+.3f}) "
                     f"lat {norm_lat:+.3f} → jx {jx:+.2f} jy {jy:+.2f} "
                     f"r {r:.2f} | 섹터 {_sec[self.base_sector]} "
                     f"| s_raw {s_raw:.2f} ramp {self.base_s_ramp:.2f} "
@@ -2692,6 +2751,7 @@ class MirobotAiNode(Node):
         설계했으므로 보정 없이도 성립한다.
         """
         if lm is None or world_lm is None:
+            self._arm_norm_fail[arm] = 'lm/world 없음'
             return None
         sh_i = 11 if arm == 'right' else 12
         el_i = 13 if arm == 'right' else 14
@@ -2700,17 +2760,24 @@ class MirobotAiNode(Node):
             s, e, w = world_lm[sh_i], world_lm[el_i], world_lm[wr_i]
             vis = min(lm[sh_i].visibility, lm[el_i].visibility, lm[wr_i].visibility)
         except (IndexError, TypeError):
+            self._arm_norm_fail[arm] = '인덱스 오류'
             return None
         if vis < self.VIS_THRESHOLD:
+            self._arm_norm_fail[arm] = f'가시성 {vis:.2f} < {self.VIS_THRESHOLD}'
             return None
 
         ua = math.sqrt((e.x - s.x) ** 2 + (e.y - s.y) ** 2 + (e.z - s.z) ** 2)
         fa = math.sqrt((w.x - e.x) ** 2 + (w.y - e.y) ** 2 + (w.z - e.z) ** 2)
         if ua < self.MIN_UPPERARM_LEN_M or fa < self.MIN_FOREARM_LEN_J3_M:
+            self._arm_norm_fail[arm] = f'분절 짧음 (상완 {ua:.3f}, 전완 {fa:.3f})'
             return None
         arm_len = ua + fa
         if not (self.ARM_LEN_SANE_MIN <= arm_len <= self.ARM_LEN_SANE_MAX):
+            self._arm_norm_fail[arm] = (
+                f'팔길이 {arm_len:.3f} 가 [{self.ARM_LEN_SANE_MIN}, '
+                f'{self.ARM_LEN_SANE_MAX}] 밖')
             return None
+        self._arm_norm_fail.pop(arm, None)
 
         vx = (w.x - s.x) / arm_len
         vy = (w.y - s.y) / arm_len
@@ -2719,16 +2786,42 @@ class MirobotAiNode(Node):
                 self.SIGN_LAT * vx,
                 self.SIGN_UP * (-vy))
 
-    def _lat_neutral_for(self, arm):
-        """해당 팔의 좌우 중립값.
+    # ══════════════════════════════════════════════════════════════════════
+    #  중립 기준이 두 벌인 이유
+    #
+    #  한 값으로 겸하려다 실패했다. 두 용도가 요구하는 것이 정반대다.
+    #
+    #    전환 트리거 — 조작자가 '의도적으로' 취하는 자세여야 한다.
+    #        쉬는 자세를 트리거로 쓰면, 팔 모드에서 반대쪽 팔은 늘 내려가
+    #        있으므로 조건이 상시 성립해 멋대로 모드가 넘어간다.
+    #
+    #    주행 조이스틱 원점 — 베이스팔이 '쉬는' 자세여야 한다.
+    #        제어팔의 캘리브 자세를 원점으로 쓰면, 팔을 내린 정지 상태가
+    #        최대 후진으로 읽혀 가만히 있어도 뒤로 달린다.
+    #
+    #  그래서 트리거는 제어팔 캘리브 중립(좌우만 미러), 주행 원점은
+    #  베이스팔 실측 중립을 쓴다.
+    # ══════════════════════════════════════════════════════════════════════
 
-        캘리브레이션은 제어팔에서만 잰다. 반대쪽 팔은 몸을 기준으로 거울상
-        이므로 부호를 뒤집어 쓴다. norm_lat 은 화면 방향 기준이라 좌우
-        '방향' 의미는 양팔이 같고, 다른 것은 쉬는 자세의 원점뿐이다.
+    def _mode_neutral_ref(self, arm):
+        """전환 트리거용 (lat, up) 기준.
+
+        양팔 모두 제어팔의 캘리브 중립 자세('팔꿈치를 편하게 굽혀 몸 앞쪽에
+        손을 둔' 자세)를 기준으로 삼는다. 좌우만 몸 기준 거울상이라 부호를
+        뒤집는다. 상하는 같은 자세면 같은 높이이므로 그대로 쓴다.
         """
         if arm == self.control_arm:
-            return self.CAL_LAT_NEUTRAL
-        return -self.CAL_LAT_NEUTRAL
+            return (self.CAL_LAT_NEUTRAL, self.CAL_UP_NEUTRAL)
+        return (-self.CAL_LAT_NEUTRAL, self.CAL_UP_NEUTRAL)
+
+    def _drive_neutral_ref(self):
+        """주행 조이스틱 원점 (lat, up). 베이스팔이 쉬는 자세다.
+
+        캘리브레이션 중립 단계에서 반대쪽 팔을 같이 재서 얻는다. 그때
+        조작자의 반대쪽 팔은 자연스럽게 내려가 있고, 그게 곧 '주행하지
+        않는 자세' 이므로 원점으로 알맞다.
+        """
+        return (self.CAL_BASE_LAT_NEUTRAL, self.CAL_BASE_UP_NEUTRAL)
 
     def _joystick_radius(self, lat, up, arm):
         """조이스틱 반경. 이 값이 BASE_DEADZONE 미만이면 '중립' 이다.
@@ -2736,50 +2829,144 @@ class MirobotAiNode(Node):
         _compute_base_cmd 와 같은 축 정규화를 쓴다. 중립 판정과 주행 정지
         판정이 같은 기준이어야 조작자 체감이 어긋나지 않는다.
         """
+        lat_ref, up_ref = self._mode_neutral_ref(arm)
         up_span = max(self.CAL_UP_MAX - self.CAL_UP_NEUTRAL, 0.10)
-        d_up = up - self.CAL_UP_NEUTRAL
+        d_up = up - up_ref
         if d_up >= 0.0:
             jy = d_up / up_span
         else:
             jy = d_up / max(up_span * self.BASE_DOWN_SPAN_SCALE, 0.10)
-        jx = (lat - self._lat_neutral_for(arm)) / max(self.BASE_LAT_SPAN, 1e-6)
+        jx = (lat - lat_ref) / max(self.BASE_LAT_SPAN, 1e-6)
         return math.hypot(jx, jy)
 
+    def _neutral_latched(self, arm, r):
+        """중립 여부를 히스테리시스로 판정한다.
+
+        TOL 아래로 들어오면 중립, TOL_EXIT 위로 나가야 해제, 그 사이는
+        직전 상태를 유지한다. 단일 임계를 쓰면 경계에서 매 프레임 참/거짓이
+        뒤집히고, 여기서는 그때마다 2.5초 누적이 0 으로 지워져 전환이
+        영영 완성되지 않는다(실측에서 0.8초까지 갔다가 리셋됐다).
+        """
+        prev = self._neutral_latch.get(arm, False)
+        if r < self.MODE_NEUTRAL_TOL:
+            cur = True
+        elif r > self.MODE_NEUTRAL_TOL_EXIT:
+            cur = False
+        else:
+            cur = prev
+        self._neutral_latch[arm] = cur
+        return cur
+
+    def _mode_block_log(self, reason, now):
+        """[진단] 모드 판정이 막힌 사유를 주기적으로 남긴다.
+
+        [모드판정] 로그는 이른 return 들보다 뒤에 있어서, 로그가 안 보이는
+        것만으로는 어느 관문에서 막혔는지 알 수 없다. 사유가 바뀔 때는
+        즉시, 같은 사유가 이어질 때는 주기적으로 찍는다.
+        """
+        if self.MODE_DEBUG_PERIOD_SEC <= 0 or not self.GRU_DEBUG_LOG:
+            return
+        if (reason != self.mode_block_dbg_last or
+                now - self.mode_block_dbg_t >= self.MODE_DEBUG_PERIOD_SEC):
+            self.mode_block_dbg_t = now
+            self.mode_block_dbg_last = reason
+            self.get_logger().info(f"[모드판정] 막힘 — {reason}")
+
     def _update_mode_gesture(self, lm, world_lm, now):
-        """손 중립 유지로 모드를 전환한다.
+        """손 '중립 자세' 를 유지해 모드를 전환한다.
 
-            제어팔만 중립 유지   →  팔 모드
-            반대쪽 팔만 중립 유지 →  베이스 모드
-            둘 다 중립 / 둘 다 활성 → 현재 모드 유지
+        ── 규칙 ────────────────────────────────────────────────────────
+            제어팔만 중립      →  ARM  (팔 조작)
+            베이스팔만 중립    →  BASE (주행)
+            둘 다 중립         →  유지  (AI ON/OFF 토글에 쓰는 자세라 비워둠)
+            둘 다 비중립       →  유지  (의도가 모호함)
+        위 목표를 MODE_NEUTRAL_HOLD_SEC(2.5초) 동안 끊김 없이 유지해야
+        실제로 전환된다. '한 손만' 이 절대 조건이다.
 
-        둘 다 중립인 상태는 조작자가 쉬는 중이다. 상태를 바꿀 이유가 없다.
-        둘 다 활성이면 의도가 모호하므로 역시 바꾸지 않는다. 동시 조작을
-        허용하지 않는 설계이므로 이 두 경우는 모두 '유지' 가 맞다.
+        ── '중립' 이 무엇인가 (여기서 가장 헷갈렸던 지점) ──────────────
+        중립은 '쉬는 자세' 가 아니라 캘리브레이션 1단계에서 잡았던
+        '팔꿈치를 편하게 굽혀 몸 앞쪽에 손을 둔' 자세다. 양팔 모두 이
+        자세를 기준으로 재며, 좌우(lat)만 몸 기준 거울상이라 부호를
+        뒤집는다(_mode_neutral_ref).
+
+        팔을 내린 쉬는 자세는 r 이 5~7 로 한참 밖이다. 그래서 조작 중에
+        멋대로 전환되지 않는다. 반대로 말하면 전환하려면 그 손을 의도적으로
+        몸 앞으로 들어야 한다.
+
+        [주의] 주행 조이스틱의 원점(_drive_neutral_ref)은 이것과 다른
+        값이다. 그쪽은 베이스팔이 '쉬는' 자세여야 한다 — 안 그러면 손을
+        가만히 둔 정지 상태가 최대 입력으로 읽혀 로봇이 저절로 달린다.
+        한 값으로 겸하려다 실패했던 부분이라 반드시 분리해서 봐야 한다.
+
+        ── 안 보이는 팔 ────────────────────────────────────────────────
+        '중립이 아님' 으로 본다. 화각이 좁은 기기에서는 팔을 내리면 프레임
+        밖으로 나가는데, 그게 바로 전환을 시도하는 순간이다. 예전처럼
+        판정을 통째로 포기하면 전환이 영영 성립하지 않는다. 없던 중립을
+        만들어내지 않으므로 오전환은 늘지 않는다.
+
+        ── 튜닝 ────────────────────────────────────────────────────────
+            MODE_NEUTRAL_TOL       중립 진입 임계 (작을수록 정확한 자세 요구)
+            MODE_NEUTRAL_TOL_EXIT  중립 해제 임계 (슈미트 트리거)
+            MODE_NEUTRAL_HOLD_SEC  유지 시간
+            MODE_COOLDOWN_SEC      전환 직후 재전환 금지
+        진단은 [모드판정] 로그를 볼 것. 막히면 사유를 직접 찍는다.
         """
         if self.homing_active or now < self.mode_cooldown_until:
             self.mode_hold_since = 0.0
             self.mode_hold_target = None
+            self._neutral_latch.clear()
+            self._mode_block_log(
+                'homing' if self.homing_active
+                else f'cooldown({self.mode_cooldown_until - now:.1f}s 남음)', now)
             return
         # 캘리브레이션 중에는 지정된 자세를 취해야 하므로 판정을 멈춘다.
         if self.calib_mode is not None or self.calib_session_active:
             self.mode_hold_since = 0.0
             self.mode_hold_target = None
+            self._neutral_latch.clear()
+            self._mode_block_log(
+                f'캘리브레이션(calib_mode={self.calib_mode}, '
+                f'session_active={self.calib_session_active})', now)
             return
 
         ctrl = self.control_arm
         other = self.base_arm()
         a = self._arm_norm(lm, world_lm, ctrl)
         b = self._arm_norm(lm, world_lm, other)
-        if a is None or b is None:
-            # 한쪽이라도 안 보이면 판정할 수 없다. 누적을 비운다.
+
+        # [수정] 예전에는 한쪽이라도 안 보이면 판정을 통째로 포기했다.
+        # 화각이 좁은 기기에서는 팔을 내리면 그 팔이 프레임 밖으로 나가는데,
+        # 그게 바로 전환을 시도하는 순간이라 판정이 늘 멈춰 있었다.
+        #
+        # 안 보이는 팔은 '중립이 아님' 으로 본다. 안전한 방향의 가정이다 —
+        # 중립은 조작자가 의도적으로 취해야 하는 자세이고, 화면에서 사라진
+        # 팔은 내려가 있거나 화각 밖이라 그 자세일 수 없다. 이 규칙은
+        # 없던 중립을 만들어내지 않으므로 오전환을 늘리지 않는다.
+        # 정작 중립이어야 하는 쪽이 안 보이면 그 팔은 중립이 아니게 되어
+        # 전환이 성립하지 않는다 — 이것도 의도한 동작이다.
+        if a is None and b is None:
             self.mode_hold_since = 0.0
             self.mode_hold_target = None
+            self._neutral_latch.clear()
+            self._mode_block_log(
+                f'양팔 모두 안 보임 — {ctrl}: {self._arm_norm_fail.get(ctrl, "?")}'
+                f' / {other}: {self._arm_norm_fail.get(other, "?")}', now)
             return
 
-        r_ctrl = self._joystick_radius(a[1], a[2], ctrl)
-        r_other = self._joystick_radius(b[1], b[2], other)
-        ctrl_neutral = r_ctrl < self.BASE_DEADZONE
-        other_neutral = r_other < self.BASE_DEADZONE
+        if a is not None:
+            r_ctrl = self._joystick_radius(a[1], a[2], ctrl)
+            ctrl_neutral = self._neutral_latched(ctrl, r_ctrl)
+        else:
+            r_ctrl = float('inf')
+            ctrl_neutral = False
+            self._neutral_latch[ctrl] = False
+        if b is not None:
+            r_other = self._joystick_radius(b[1], b[2], other)
+            other_neutral = self._neutral_latched(other, r_other)
+        else:
+            r_other = float('inf')
+            other_neutral = False
+            self._neutral_latch[other] = False
 
         if ctrl_neutral and not other_neutral:
             target = 'arm'
@@ -2788,20 +2975,58 @@ class MirobotAiNode(Node):
         else:
             target = None
 
+        # 베이스팔 중립을 아직 실측하지 않았으면 진입을 막는다. 기본값과
+        # 실제가 어긋난 만큼이 정지 자세에서 그대로 주행 명령이 되어,
+        # 손을 가만히 둬도 로봇이 흘러간다. ARM 으로 나오는 길은 막지 않는다.
+        if target == 'base' and not self.CAL_BASE_SET:
+            self.mode_hold_since = 0.0
+            self.mode_hold_target = None
+            self._neutral_latch.clear()
+            self._mode_block_log(
+                '베이스팔 중립 미측정 — 캘리브레이션을 먼저 하세요 '
+                '(1단계에서 반대쪽 팔도 함께 측정됩니다)', now)
+            return
+
         if self.MODE_DEBUG_PERIOD_SEC > 0 and self.GRU_DEBUG_LOG:
             if now - self.mode_dbg_t >= self.MODE_DEBUG_PERIOD_SEC:
                 self.mode_dbg_t = now
                 held = (now - self.mode_hold_since) if self.mode_hold_since else 0.0
+                # up/lat 원값도 같이 남긴다. r 만으로는 '자세를 안 잡은 것'과
+                # '중립 기준값이 애초에 도달 불가인 것'을 구분할 수 없다.
                 self.get_logger().info(
-                    f"[모드판정] {ctrl} r {r_ctrl:.2f}"
-                    f"{'(중립)' if ctrl_neutral else '      '}  "
-                    f"{other} r {r_other:.2f}"
-                    f"{'(중립)' if other_neutral else '      '}  "
+                    f"[모드판정] {ctrl} "
+                    f"{('r %.2f' % r_ctrl) if a is not None else 'r  안보임'}"
+                    f"{'(중립)' if ctrl_neutral else '      '}"
+                    f"{(' up%+.3f lat%+.3f' % (a[2], a[1])) if a is not None else ''}   "
+                    f"{other} "
+                    f"{('r %.2f' % r_other) if b is not None else 'r  안보임'}"
+                    f"{'(중립)' if other_neutral else '      '}"
+                    f"{(' up%+.3f lat%+.3f' % (b[2], b[1])) if b is not None else ''}   "
+                    f"[기준 up중립{self.CAL_UP_NEUTRAL:+.3f} up최대{self.CAL_UP_MAX:+.3f} "
+                    f"lat중립{self.CAL_LAT_NEUTRAL:+.3f} "
+                    f"허용{self.MODE_NEUTRAL_TOL}/{self.MODE_NEUTRAL_TOL_EXIT}]  "
                     f"현재 {self.mode.upper()}  "
                     f"목표 {self.mode_hold_target or '-'} {held:.1f}/"
                     f"{self.MODE_NEUTRAL_HOLD_SEC:.1f}s")
 
         if target is None or target == self.mode:
+            # [진단] 쌓이던 유지 시간이 지워지는 순간을 놓치지 않고 남긴다.
+            # 주기 로그(2초)만으로는 '언제, 왜' 끊겼는지 알 수 없다.
+            held = (now - self.mode_hold_since) if self.mode_hold_since else 0.0
+            if held >= 0.5 and self.mode_hold_target:
+                if ctrl_neutral and other_neutral:
+                    why = (f'양손 모두 중립이 되어 목표가 사라짐 '
+                           f'({ctrl} r{r_ctrl:.2f}, {other} r{r_other:.2f}) '
+                           f'— 양손 중립은 AI 토글용이라 전환하지 않는다')
+                elif not ctrl_neutral and not other_neutral:
+                    why = (f'중립이던 손이 이탈 '
+                           f'({ctrl} r{r_ctrl:.2f}, {other} r{r_other:.2f} '
+                           f'> 해제임계 {self.MODE_NEUTRAL_TOL_EXIT})')
+                else:
+                    why = f'목표가 현재 모드와 같아짐 ({target})'
+                self.get_logger().warn(
+                    f"[모드판정] 전환 중단 — {self.mode_hold_target} 유지 "
+                    f"{held:.1f}/{self.MODE_NEUTRAL_HOLD_SEC:.1f}s 에서 {why}")
             self.mode_hold_since = 0.0
             self.mode_hold_target = None
             return
@@ -2855,6 +3080,7 @@ class MirobotAiNode(Node):
         self.calib_samples_pos = []
         self.calib_samples_arm = []
         self.calib_samples_j6 = []
+        self.calib_samples_base = []
         self.calib_samples_wrist = []
         self._publish_calib_status(
             force=True,
@@ -2929,6 +3155,31 @@ class MirobotAiNode(Node):
                         "[캘리브레이션] J6 기준 롤 샘플이 부족합니다 — "
                         "임시 기준을 그대로 씁니다.")
 
+                # ── 베이스팔 중립 확정 ───────────────────────────────
+                # 중앙값을 쓴다. 조작자가 제어팔 자세를 잡는 동안 반대쪽
+                # 팔이 잠깐 따라 움직이는 프레임이 섞이는데, 평균은 그
+                # 영향을 받는다. 샘플이 모자라면(반대쪽 팔이 화각 밖이면)
+                # 기본값을 그대로 두고 경고만 남긴다 — 잘못된 기준을 넣는
+                # 것보다 기본값이 낫다.
+                if len(self.calib_samples_base) >= 5:
+                    lat_arr = sorted(x[0] for x in self.calib_samples_base)
+                    up_arr  = sorted(x[1] for x in self.calib_samples_base)
+                    self.CAL_BASE_LAT_NEUTRAL = lat_arr[len(lat_arr) // 2]
+                    self.CAL_BASE_UP_NEUTRAL  = up_arr[len(up_arr) // 2]
+                    self.CAL_BASE_SET = True
+                    self.get_logger().info(
+                        f"[캘리브레이션] 베이스팔({self.base_arm()}) 중립 "
+                        f"lat={self.CAL_BASE_LAT_NEUTRAL:+.3f} "
+                        f"up={self.CAL_BASE_UP_NEUTRAL:+.3f} "
+                        f"(샘플 {len(up_arr)}개)")
+                else:
+                    self.get_logger().warn(
+                        f"[캘리브레이션] 베이스팔이 충분히 보이지 않아 중립을 재지 "
+                        f"못했습니다(샘플 {len(self.calib_samples_base)}개) — "
+                        f"기본값 up={self.CAL_BASE_UP_NEUTRAL:+.3f} 를 씁니다. "
+                        f"베이스 조작이 어긋나면 양팔이 모두 화면에 들어오도록 "
+                        f"카메라를 조정하고 다시 캘리브레이션하세요.")
+
                 self.get_logger().info(
                     f"[캘리브레이션] 중립 fwd={avg_fwd:.3f} lat={avg_lat:.3f} up={avg_up:.3f}")
 
@@ -2981,6 +3232,7 @@ class MirobotAiNode(Node):
         self.calib_samples_pos = []
         self.calib_samples_arm = []
         self.calib_samples_j6 = []
+        self.calib_samples_base = []
         self.calib_samples_wrist = []
 
         if current_idx + 1 < len(self.CALIB_STAGES):
@@ -3525,6 +3777,21 @@ class MirobotAiNode(Node):
                 # 투영 단축 때문에 실제보다 짧게 측정되어 기준값으로 부적절하다.
                 if self.calib_mode == 'neutral' and raw_arm_len is not None:
                     self.calib_samples_arm.append(raw_arm_len)
+
+                # ── 베이스팔 중립도 같이 잰다 ───────────────────────────
+                # 제어팔의 중립값을 베이스팔에 그대로 쓰면 안 된다. 중립
+                # 단계의 지시는 '제어팔을 몸 앞쪽에' 인데, 그때 반대쪽 팔은
+                # 자연스럽게 내려가 있다. 상하 위치가 아예 달라서 거울상으로
+                # 뒤집는 것으로도 메울 수 없다. 지금 이 순간의 반대쪽 팔이
+                # 곧 '주행을 안 하는 자세' 이므로 그대로 기준으로 삼는다.
+                # (조작자가 따로 할 일이 없다는 점이 이 방식의 이점이다)
+                if self.calib_mode == 'neutral':
+                    _clm = (pose_results.pose_landmarks.landmark
+                            if pose_results.pose_landmarks else None)
+                    _bn_cal = self._arm_norm(_clm, world_lm, self.base_arm())
+                    if _bn_cal is not None:
+                        self.calib_samples_base.append((_bn_cal[1], _bn_cal[2]))
+
                 if len(self.calib_samples_pos) >= self.CALIB_REQUIRED_SAMPLES:
                     self._finish_calib_stage()
 

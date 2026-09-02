@@ -135,8 +135,15 @@ for port in 9090 8443 5000 5001; do
   fi
 done
 
-MY_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+# 접속 가능한 주소를 전부 모은다. Tailscale 을 쓰면 wlan0(192.168.x)과
+# tailscale0(100.x)이 동시에 존재하는데, 예전처럼 첫 번째 하나만 안내하면
+# 다른 망에서 접속할 때 어느 주소를 인증서 승인해야 하는지 알 수 없었다.
+ALL_IPS=$(ip -4 -o addr show scope global 2>/dev/null \
+          | awk '{split($4,a,"/"); print a[1]}' | sort -u)
+MY_IP=$(echo "$ALL_IPS" | grep -v '^100\.' | head -1)
+[ -z "$MY_IP" ] && MY_IP=$(echo "$ALL_IPS" | head -1)
 [ -z "$MY_IP" ] && MY_IP="<파이 IP>"
+TS_IP=$(echo "$ALL_IPS" | grep '^100\.' | head -1)
 
 echo ""
 # ══════════════════════════════════════════════════════════════════════════
@@ -170,13 +177,25 @@ echo -e "${C_G}  실행 완료${C_0}   팔:$($USE_ARM && echo ON || echo OFF)"\
 "  AI:$($USE_AI && echo ON || echo OFF)  베이스:$($USE_BASE && echo ON || echo OFF)"
 echo -e "${C_G}════════════════════════════════════════════════════════${C_0}"
 echo ""
-echo -e "  조작 기기 브라우저에서:  ${C_B}https://$MY_IP:8443/index.html${C_0}"
-echo ""
-echo -e "  ${C_Y}처음 접속하는 기기라면${C_0} 아래 세 곳을 먼저 열어 인증서를 승인하세요:"
-echo -e "    ${C_B}https://$MY_IP:5000/video_feed${C_0}"
-echo -e "    ${C_B}https://$MY_IP:5001${C_0}"
-echo -e "    ${C_B}https://$MY_IP:9090${C_0}"
-echo -e "  IP 입력칸에 ${C_B}$MY_IP${C_0} 를 넣고 연결하세요."
+# 접속에 쓴 주소와 GUI 의 IP 입력칸 값은 반드시 같아야 한다. 페이지는
+# 8443 으로 열고 입력칸에는 다른 주소를 넣으면, WSS(9090/5001)가 인증서
+# 예외를 못 받은 origin 으로 가서 조용히 실패한다 — 화면은 나오는데
+# 로봇이 안 움직이는 증상이 정확히 이것이다.
+for _ip in $ALL_IPS; do
+  _label=""
+  case "$_ip" in 100.*) _label="  (Tailscale)" ;; esac
+  echo -e "  브라우저에서:  ${C_B}https://$_ip:8443/index.html${C_0}$_label"
+  echo -e "  ${C_Y}처음 접속하는 기기라면${C_0} 아래 세 곳도 먼저 열어 인증서를 승인:"
+  echo -e "    ${C_B}https://$_ip:5000/video_feed${C_0}"
+  echo -e "    ${C_B}https://$_ip:5001${C_0}"
+  echo -e "    ${C_B}https://$_ip:9090${C_0}"
+  echo -e "  그리고 IP 입력칸에 ${C_B}$_ip${C_0} — 페이지를 연 주소와 같은 것을 넣으세요."
+  echo ""
+done
+if [ -n "$TS_IP" ]; then
+  echo -e "  ${C_Y}주의${C_0} 인증서는 위 주소들이 모두 들어가야 유효합니다."
+  echo -e "        주소가 바뀌었으면:  ${C_B}$WEBGUI_DIR/setup_https.sh${C_0} 재실행 후 전체 재시작"
+fi
 echo ""
 echo -e "  토픽 확인 (다른 창):"
 echo -e "    ${C_B}source /opt/ros/$ROS_DISTRO_NAME/setup.bash && export ROS_DOMAIN_ID=$ROS_DOMAIN_ID${C_0}"
