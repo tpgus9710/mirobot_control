@@ -59,7 +59,14 @@ JPEG_QUALITY = 70          # rpicam-vid 의 MJPEG 품질(1~100)
 # 토픽이 1Hz 로 반복 발행되므로 방어용으로 둔다.
 SWITCH_DEBOUNCE_SEC = 1.5
 
-RESTART_DELAY_SEC = 2.0    # rpicam-vid 가 죽었을 때 재기동까지 대기
+RESTART_DELAY_SEC = 2.0    # rpicam-vid 가 죽었을 때 첫 재기동까지 대기
+# 재기동이 계속 실패하면 대기를 2배씩 늘려 이 값까지 간다.
+# 실패가 이어지는 가장 흔한 원인은 '다른 프로세스가 카메라를 쥐고 있음'인데,
+# 그건 저절로 풀리지 않는다. 고정 2초로 두었더니 16시간짜리 유령 노드가
+# 카메라를 붙든 동안 초당 0.5회씩 영영 재기동하며 CPU 와 로그를 갉아먹었다.
+RESTART_DELAY_MAX_SEC = 30.0
+# 이만큼 연속 실패하면 원인 안내를 한 번 띄운다(매번 띄우면 로그가 묻힌다).
+RESTART_HINT_AFTER = 3
 CERT_DIR = os.path.expanduser('~/webgui_certs')
 
 SOI = b'\xff\xd8'          # JPEG 시작
@@ -192,6 +199,7 @@ class RobotCamNode(Node):
     # ── 캡처 루프 ─────────────────────────────────────────────────────────
     def _capture_loop(self):
         buf = bytearray()
+        fail_streak = 0        # 연속 재기동 실패 횟수 (백오프 계산용)
         while self.running:
             # 전환 요청 처리 (디바운스 경과 후에만)
             if (self.desired_cam != self.active_cam and
@@ -220,14 +228,28 @@ class RobotCamNode(Node):
 
             chunk = self.proc.stdout.read(4096)
             if not chunk:
+                fail_streak += 1
+                delay = min(RESTART_DELAY_SEC * (2 ** (fail_streak - 1)),
+                            RESTART_DELAY_MAX_SEC)
                 self.get_logger().warn(
                     f"rpicam-vid(cam{self.active_cam}) 종료됨 — "
-                    f"{RESTART_DELAY_SEC:.0f}초 후 재기동")
+                    f"{delay:.0f}초 후 재기동 (연속 {fail_streak}회)")
+                if fail_streak == RESTART_HINT_AFTER:
+                    self.get_logger().error(
+                        f"cam{self.active_cam} 을 계속 못 엽니다. 다른 프로세스가"
+                        " 쥐고 있을 가능성이 큽니다. 확인:  pgrep -af rpicam-vid")
                 self._kill()
                 self.active_cam = None
                 buf.clear()
-                time.sleep(RESTART_DELAY_SEC)
+                time.sleep(delay)
                 continue
+
+            # 프레임이 들어왔으면 카메라가 살아난 것이다. 백오프를 되돌린다.
+            if fail_streak:
+                self.get_logger().info(
+                    f"rpicam-vid(cam{self.active_cam}) 정상화 — "
+                    f"{fail_streak}회 실패 후 복구")
+                fail_streak = 0
 
             buf.extend(chunk)
 

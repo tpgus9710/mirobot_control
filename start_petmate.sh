@@ -137,10 +137,16 @@ if $USE_ARM; then
 fi
 
 # 이전 실행이 포트를 쥐고 있으면 새 프로세스가 조용히 죽는다.
+#
+# [주의] 아래 목록에 robot_cam_node 가 빠져 있어서, 안내대로 정리해도 5002 만
+# 계속 남는 문제가 있었다. 남은 노드는 rpicam-vid 를 계속 붙들고 있고, 새로
+# 뜬 노드는 카메라를 못 열어 2초마다 재기동을 반복한다. 목록에 반드시 이
+# 스크립트가 띄우는 모든 실행 파일이 들어 있어야 한다.
+STALE_PATTERN="ai_node_new|rosbridge|https_server|robot_cam_node|$BASE_EXEC"
 for port in 9090 8443 5000 5001 5002; do
   if ss -ltn 2>/dev/null | grep -q ":$port "; then
     warn "포트 $port 사용 중 — 이전 실행이 남아있습니다."
-    warn "  정리:  pkill -f 'ai_node_new|rosbridge|https_server|$BASE_EXEC'"
+    warn "  정리:  pkill -f '$STALE_PATTERN'"
   fi
 done
 
