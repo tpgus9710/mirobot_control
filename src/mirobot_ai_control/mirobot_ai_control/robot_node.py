@@ -54,6 +54,18 @@ class MirobotDriverNode(Node):
         self.last_limit_warn_time = 0.0
         self.limit_warn_interval = 1.0  # 범위 초과 경고 로그 스팸 방지 (1초당 최대 1회)
 
+        # 컨트롤러가 스스로 밀어 주는 "<Idle,...>" 텔레메트리에는 실제 관절각이
+        # 들어 있는데, 예전에는 맨 앞 상태 토큰만 쓰고 나머지를 버렸다. 그래서
+        # "지금 팔이 몇 도인가"를 볼 방법이 시스템에 아예 없었다 — GUI 슬라이더도
+        # ai_node 로그도 전부 '보낸 값'이지 '도달한 값'이 아니다.
+        # 보낸 값과 도달한 값이 어긋나는 상황(가동범위 밖 명령 등)을 잡으려면
+        # 실제 값이 반드시 필요하므로, 원문 그대로 주기 로그로 남긴다.
+        # 0 으로 두면 끈다. 별도의 '?' 질의는 보내지 않는다 — 이 드라이버는
+        # 시리얼에 명령이 하나만 떠 있게 유지하는 설계라 질의를 끼워 넣으면
+        # ok 카운트가 어긋난다.
+        self.telemetry_log_interval = 1.0
+        self.last_telemetry_log_time = 0.0
+
         # ── 단일 대기열 기반 큐잉 상태 ──────────────────────────────────────
         # 팔(joint)과 그리퍼(gripper) 명령을 각각 "가장 최신 값"으로만 저장해두고,
         # 시리얼 상에 명령이 하나도 떠 있지 않을 때(busy==False)만 순서대로 하나씩 꺼내 보냄.
@@ -159,6 +171,15 @@ class MirobotDriverNode(Node):
                 self.idle_streak += 1
             elif token in ("Alarm", "Home", "Run", "Jog"):
                 self.idle_streak = 0
+
+            # 실제 관절각 관찰용. 파싱하지 않고 원문을 그대로 남긴다 —
+            # 펌웨어마다 필드 이름과 순서가 달라, 섣불리 해석하면 틀린 값을
+            # 확신에 차서 찍게 된다. 눈으로 보고 필요하면 그때 파서를 붙일 것.
+            if self.telemetry_log_interval > 0:
+                now = time.time()
+                if now - self.last_telemetry_log_time >= self.telemetry_log_interval:
+                    self.last_telemetry_log_time = now
+                    self.get_logger().info(f"[실제상태] {line}")
 
     # 로봇 부팅 시 비동기 스레드로 홈 복귀 시퀀스 가동 (실행 병목 제거)
     def init_robot(self):
