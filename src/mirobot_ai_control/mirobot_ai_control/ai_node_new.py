@@ -3016,7 +3016,13 @@ class MirobotAiNode(Node):
         vx = (w.x - s.x) / arm_len
         vy = (w.y - s.y) / arm_len
         vz = (w.z - s.z) / arm_len
-        return (self.SIGN_FWD * (-vz),
+        # 전방은 깊이(-vz)가 아니라 수평면 위의 팔 길이로 잰다. 단안 카메라의
+        # MediaPipe z 는 잡음이 커서 -vz 만 쓰면 팔을 가만히 둬도 값이 흔들린다.
+        # hypot(vx, vz) 는 어깨→손목을 수평면에 내린 길이라 "팔을 얼마나
+        # 뻗었나"를 안정적으로 나타낸다. 대신 두 가지 성질이 따라온다:
+        #   · 부호가 없다 — 손을 몸 뒤로 넘겨도 앞으로 뻗은 것과 구분되지 않는다.
+        #   · 옆으로 뻗어도 전방값이 커진다 — 항상 |norm_lat| <= norm_fwd 다.
+        return (self.SIGN_FWD * math.hypot(vx, vz),
                 self.SIGN_LAT * vx,
                 self.SIGN_UP * (-vy))
 
@@ -4100,9 +4106,10 @@ class MirobotAiNode(Node):
                     vz = (wr_p[2] - sh_p[2]) / arm_len
 
                     # MediaPipe world 좌표계: y는 아래로 +, z는 카메라에서 멀수록 +
-                    #  → 팔을 카메라 쪽으로 뻗으면 z가 감소하므로 -vz가 "앞으로"
                     #  → 손을 위로 올리면 y가 감소하므로 -vy가 "위로"
-                    norm_fwd = self.SIGN_FWD * (-vz)
+                    #  → 전방은 hypot(vx, vz), 즉 수평면 위의 팔 길이다.
+                    #    이유와 부작용은 _arm_norm() 의 같은 자리 주석 참고.
+                    norm_fwd = self.SIGN_FWD * math.hypot(vx, vz)
                     norm_lat = self.SIGN_LAT * (vx)
                     norm_up  = self.SIGN_UP  * (-vy)
                     pos_valid = True
