@@ -72,6 +72,26 @@ class MirobotDriverNode(Node):
         self.telemetry_log_interval = 1.0
         self.last_telemetry_log_time = 0.0
 
+        # ── 시리얼 링크 상태 ────────────────────────────────────────────
+        # USB 시리얼은 끊긴다. 파이 전원이 순간 처지면 CH341 이 통째로 재열거되고
+        # (dmesg 에 'ch341-uart converter now attached to ttyUSB0' 가 다시 찍힌다)
+        # 그 순간 진행 중이던 write 가 [Errno 5] 로 실패한다.
+        #
+        # 예전에는 그 예외가 콜백 밖으로 튀어나가 rclpy.spin 을 무너뜨려서
+        # 노드가 통째로 죽었다. USB 는 곧 다시 붙는데 드라이버만 사라지는
+        # 상황이라, "로봇이 멈췄다"로 보였다. 이제는 링크만 끊긴 것으로 보고
+        # 노드는 살려 둔 채 재연결한다.
+        self.port = port
+        self.baud = baud
+        self.link_ok = False          # 시리얼이 살아 있고 명령을 보내도 되는가
+        self.link_lost_logged = False
+        # 재연결 직후에는 컨트롤러가 리셋됐는지 알 수 없다. 위치를 모르는 채
+        # G0 를 보내면 엉뚱한 자세로 급이동하므로, 사용자가 호밍하기 전까지는
+        # 관절 명령을 내보내지 않는다. 자동 호밍은 일부러 하지 않는다 —
+        # 저전압이 반복되면 그때마다 팔이 움직여 오히려 위험하다.
+        self.needs_homing_after_reconnect = False
+        self.RECONNECT_DELAY_SEC = 3.0
+
         # ── 단일 대기열 기반 큐잉 상태 ──────────────────────────────────────
         # 팔(joint)과 그리퍼(gripper) 명령을 각각 "가장 최신 값"으로만 저장해두고,
         # 시리얼 상에 명령이 하나도 떠 있지 않을 때(busy==False)만 순서대로 하나씩 꺼내 보냄.
@@ -109,11 +129,18 @@ class MirobotDriverNode(Node):
             self.reader_thread = threading.Thread(target=self._serial_reader_loop, daemon=True)
             self.reader_thread.start()
 
+            self.link_ok = True
             self.init_robot()
         except Exception as e:
             self.get_logger().error(f"Failed to connect to serial port: {e}")
             self.ser = None
             self.is_homing = False
+            self.link_ok = False
+
+        # 링크가 끊기면 되살리는 감시 스레드. 최초 연결 실패에도 계속 재시도한다.
+        self.reconnect_thread = threading.Thread(
+            target=self._reconnect_loop, daemon=True)
+        self.reconnect_thread.start()
 
         # 6개 관절 각도 명령 수신 구독자 설정
         self.joint_sub = self.create_subscription(
@@ -142,6 +169,64 @@ class MirobotDriverNode(Node):
         # 대기열에서 다음 명령을 꺼내 보낼 수 있는지 계속 확인하는 타이머 (33Hz)
         self.send_timer = self.create_timer(0.03, self._try_send_pending)
 
+    # ── 시리얼 쓰기 (실패해도 노드를 죽이지 않는다) ──────────────────────────
+    def _write(self, data, what=""):
+        """시리얼에 쓴다. 실패하면 링크를 끊긴 것으로 표시하고 False 를 돌려준다.
+
+        이 함수를 거치지 않는 ser.write 를 새로 만들지 말 것. 콜백이나 타이머
+        안에서 예외가 나면 rclpy 가 그대로 노드를 내린다.
+        """
+        if not self.ser or not self.ser.is_open or not self.link_ok:
+            return False
+        try:
+            with self.serial_lock:
+                self.ser.write(data)
+            return True
+        except Exception as e:
+            self._mark_link_lost(f"{what} 전송 실패: {e}")
+            return False
+
+    def _mark_link_lost(self, reason):
+        if self.link_ok:
+            self.get_logger().error(
+                f"시리얼 링크가 끊겼습니다 — {reason}. "
+                f"{self.RECONNECT_DELAY_SEC:.0f}초마다 재연결을 시도합니다.")
+        self.link_ok = False
+        # 끊긴 동안 쌓인 목표값은 버린다. 되살아난 뒤 낡은 값이 그대로 나가면
+        # 로봇이 갑자기 그 자세로 급이동한다(호밍 직후와 같은 사고 경로).
+        self.pending_joint_target = None
+        self.pending_gripper_target = None
+        self.busy = False
+        try:
+            if self.ser:
+                self.ser.close()
+        except Exception:
+            pass
+
+    def _reconnect_loop(self):
+        """링크가 끊겨 있으면 주기적으로 다시 연다."""
+        while rclpy.ok():
+            if self.link_ok:
+                time.sleep(0.5)
+                continue
+            time.sleep(self.RECONNECT_DELAY_SEC)
+            try:
+                self.ser = serial.Serial(self.port, self.baud, timeout=1)
+            except Exception as e:
+                if not self.link_lost_logged:
+                    self.get_logger().warn(f"재연결 대기 중 — {e}")
+                    self.link_lost_logged = True
+                continue
+            self.link_lost_logged = False
+            self.link_ok = True
+            self.needs_homing_after_reconnect = True
+            self.is_homing = False
+            self.busy = False
+            self.get_logger().warn(
+                f"시리얼 재연결됨 ({self.port}). 다만 컨트롤러가 리셋됐는지 알 수 "
+                "없어 현재 관절 위치를 신뢰할 수 없습니다. "
+                "GUI 의 호밍 버튼을 누르기 전까지 관절 명령을 보내지 않습니다.")
+
     # ── 상시 시리얼 리더 스레드 ──────────────────────────────────────────────
     def _serial_reader_loop(self):
         while rclpy.ok():
@@ -150,7 +235,10 @@ class MirobotDriverNode(Node):
                 continue
             try:
                 raw = self.ser.readline()  # timeout=1초라서 데이터 없으면 최대 1초 후 빈 바이트 반환
-            except Exception:
+            except Exception as e:
+                # 읽기 실패도 대개 USB 가 빠진 것이다. 쓰기 쪽과 같은 경로로 처리해
+                # 재연결 스레드가 되살리게 한다.
+                self._mark_link_lost(f"읽기 실패: {e}")
                 time.sleep(0.05)
                 continue
 
@@ -222,8 +310,10 @@ class MirobotDriverNode(Node):
             self.ok_seen_count = 0
             self.idle_streak = 0
             ok_before = self.ok_seen_count
-
-            self.ser.write(b"$H\r\n")
+        if not self._write(b"$H\r\n", "호밍($H)"):
+            self.get_logger().error("호밍 명령을 보내지 못했습니다 — 링크 끊김")
+            self.is_homing = False
+            return
 
         start_time = time.time()
         homing_acked = False
@@ -243,8 +333,7 @@ class MirobotDriverNode(Node):
         if self.idle_streak < 3:
             self.get_logger().warn("Idle 상태를 충분히 확인하지 못했습니다. 그래도 진행하지만 결과를 주의 깊게 확인하세요.")
 
-        with self.serial_lock:
-            self.ser.write(b"O105\r\n")
+        self._write(b"O105\r\n", "O105")
         time.sleep(0.5)
 
         # 호밍 중 어떤 경로로든 큐에 쌓였을 가능성까지 마지막으로 차단한다.
@@ -253,6 +342,8 @@ class MirobotDriverNode(Node):
         self.pending_joint_target = None
         self.pending_gripper_target = None
         self.is_homing = False
+        # 호밍이 끝났으면 자세를 다시 신뢰할 수 있다. 재연결 차단을 푼다.
+        self.needs_homing_after_reconnect = False
         # 호밍 직후 로봇은 실제로 정지·대기 상태이므로 busy를 확실히 풀어줌
         self.busy = False
         self.get_logger().info("Mirobot 호밍 및 가동 초기화가 완전히 완료되었습니다!")
@@ -279,9 +370,8 @@ class MirobotDriverNode(Node):
                     threading.Thread(target=self.run_homing_sequence, daemon=True).start()
             else:
                 if not self.is_homing:
-                    with self.serial_lock:
-                        self.ser.write(f"{cmd}\r\n".encode())
-                    self.get_logger().info(f"Sent Raw G-Code: {cmd}")
+                    if self._write(f"{cmd}\r\n".encode(), f"raw({cmd})"):
+                        self.get_logger().info(f"Sent Raw G-Code: {cmd}")
 
     # 수신된 J1~J6 관절 값의 유효성만 검사하고, "가장 최신 목표값"으로 저장만 해둠.
     # 실제 전송은 _try_send_pending()이 이전 명령의 'ok'를 확인한 뒤 담당함.
@@ -432,6 +522,12 @@ class MirobotDriverNode(Node):
             else:
                 return  # 아직 직전 명령 완료 안 됨 → 대기
 
+        if self.needs_homing_after_reconnect:
+            # 재연결 직후. 실제 자세를 모르는 상태라 목표값을 계속 버린다.
+            self.pending_joint_target = None
+            self.pending_gripper_target = None
+            return
+
         if self.pending_joint_target is not None:
             target = self.pending_joint_target
             self.pending_joint_target = None
@@ -455,18 +551,23 @@ class MirobotDriverNode(Node):
     def _dispatch(self, gcode, log_msg):
         """실제 시리얼 전송 + busy 상태 진입 (공통 로직 묶음)"""
         self._expected_ok_count = self.ok_seen_count
-        with self.serial_lock:
-            self.ser.write(gcode.encode())
+        if not self._write(gcode.encode(), "관절/그리퍼 명령"):
+            return          # 링크가 끊겼다. busy 로 만들지 않는다.
         self.get_logger().info(log_msg)
         self.busy = True
         self.busy_since = time.time()
 
     # 노드 종료 시 로봇 하드웨어의 모터를 안전 대기 모드로 전환하고 세션 폐쇄함
     def destroy_node(self):
-        if self.ser and self.ser.is_open:
-            with self.serial_lock:
-                self.ser.write(b"M18\r\n")
-                self.ser.close()
+        # 종료 경로에서 예외가 나면 정리가 중단된다. USB 가 이미 빠진 상태로
+        # 종료되는 경우가 실제로 있으므로 조용히 넘어간다.
+        try:
+            if self.ser and self.ser.is_open:
+                with self.serial_lock:
+                    self.ser.write(b"M18\r\n")
+                    self.ser.close()
+        except Exception as e:
+            self.get_logger().warn(f"종료 중 시리얼 정리 실패(무시): {e}")
         super().destroy_node()
 
 # ROS 2 시스템 초기화 및 드라이버 노드 스핀 실행 처리함
